@@ -22,7 +22,7 @@ def main() -> None:
 
     print(f"key:   set ({key[:6]}...)")
     print(f"base:  {base or 'api.openai.com (no OPENAI_BASE_URL set)'}")
-    print(f"model: {llm.MODEL}")
+    print(f"model: {llm.default_model()}")
 
     print("\nCalling the model...")
     try:
@@ -30,8 +30,8 @@ def main() -> None:
     except Exception as err:  # noqa: BLE001 - we want a friendly one-liner, not a trace
         msg = str(err)
         if "model_not_found" in msg or "does not exist" in msg or "model not found" in msg.lower():
-            print("  model_not_found: the MODEL id in lucid/llm.py is not one your provider serves.")
-            print("  Swap it for a real model (keep OPENAI_BASE_URL if you route through a gateway).")
+            print("  model_not_found: the selected OPENAI_MODEL is not one your provider serves.")
+            print("  Set OPENAI_MODEL to an available model ID (keep OPENAI_BASE_URL for your gateway).")
         else:
             print(f"  call failed: {msg}")
         return

@@ -4,8 +4,8 @@ This is the thinnest possible wrapper around a chat model. The whole point of
 the course is that YOU own the harness, so we keep the provider layer tiny and
 readable: one function to call the model, one helper to parse its reply.
 
-The model is OpenAI-compatible, so we use the `openai` SDK. To swap models,
-change the one line marked below (and the base URL if your provider differs).
+Providers use the OpenAI-compatible API. Configure OPENAI_MODEL and
+OPENAI_BASE_URL, or pass a model per call; credentials stay in the environment.
 """
 
 import json
@@ -14,17 +14,24 @@ import re
 
 from openai import OpenAI
 
-# The model we call. It is OpenAI-compatible, so any provider that speaks the
-# same API works. Swap this one string to change models — that is the whole
-# "model-agnostic" promise: swap the model, keep the method.
-# Setting OPENAI_BASE_URL (see .env.example) routes this model through an
-# OpenAI-compatible gateway, so the same code works with any such provider.
-# This is a real, public model — the one the baseline in this course was
-# actually run with, through the Requesty gateway (see .env.example).
+# Legacy course default. Availability is provider-dependent; prefer an explicit
+# OPENAI_MODEL or a per-audit selection from the provider's current catalog.
 MODEL = "openai/gpt-5.6-luna"
 
 
-def _client() -> OpenAI:
+def default_model() -> str:
+    """Resolve the environment default without mutating global model state."""
+    return validate_model(os.environ.get("OPENAI_MODEL", MODEL))
+
+
+def validate_model(model: str) -> str:
+    model = model.strip()
+    if not model or len(model) > 256 or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in model):
+        raise ValueError("Use a model ID of at most 256 characters without whitespace or control characters.")
+    return model
+
+
+def _client(*, timeout: float = 600.0) -> OpenAI:
     """Build the API client, reading the key from the environment.
 
     We never hard-code a key. It comes from OPENAI_API_KEY (see .env.example).
@@ -40,11 +47,27 @@ def _client() -> OpenAI:
         )
     base_url = os.environ.get("OPENAI_BASE_URL")
     if base_url:
-        return OpenAI(api_key=api_key, base_url=base_url)
-    return OpenAI(api_key=api_key)
+        return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
+    return OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
 
-def complete(system: str, user: str, json_mode: bool = True) -> str:
+def list_models() -> list[dict[str, str]]:
+    """List IDs only, without forwarding provider metadata or invoking inference."""
+    with _client(timeout=10.0) as client:
+        page = client.models.list()
+    ids = set()
+    for item in page.data:
+        try:
+            ids.add(validate_model(item.id))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return [{"id": model} for model in sorted(ids)]
+
+
+def complete(
+    system: str, user: str, json_mode: bool = True, *,
+    model: str | None = None, reasoning_effort: str | None = None,
+) -> str:
     """Send one system + one user message to the model and return the reply text.
 
     Args:
@@ -52,45 +75,36 @@ def complete(system: str, user: str, json_mode: bool = True) -> str:
         user:      the actual request (here: the code to audit).
         json_mode: if True, ask the API to return strict JSON (JSON mode). This
                    makes parsing far more reliable than free-form text.
+        model:     per-call model ID; defaults to OPENAI_MODEL or the course fallback.
+        reasoning_effort: optional provider-specific reasoning control.
 
     Returns:
         The raw text of the model's reply. Parsing is a separate step so the
         caller can decide what to do with it.
     """
-    client = _client()
-
     # Build the call arguments. JSON mode tells the API "the reply MUST be a
     # valid JSON object", which removes a whole class of parsing headaches. Not
     # every model supports it, so it stays optional — and we only add the
     # response_format key when we actually want it. Passing response_format=None
     # trips up some OpenAI-compatible gateways, so we leave it out entirely.
     kwargs = {
-        "model": MODEL,
+        "model": validate_model(model) if model is not None else default_model(),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        # A low but non-zero temperature. Pure greedy decoding (temperature=0)
-        # can fixate on a locally-confident reasoning path and repeat itself;
-        # a small amount of randomness lets the model consider a close-second
-        # token instead. And the API isn't fully deterministic at 0 anyway
-        # (provider-side batching and routing add their own variance), so
-        # we may as well pick the value that's kindest to reasoning quality,
-        # not the one that merely looks stable.
-        "temperature": 0.3,
-        # gpt-5.6-luna is a reasoning model: it thinks before it answers, and
-        # this dial controls how much. "high" spends more of that thinking
-        # budget — worth it here, since auditing a whole codebase in one pass
-        # is exactly the kind of task that rewards more deliberation, not
-        # less. (On some reasoning models, temperature is quietly ignored
-        # once reasoning_effort is set — we send both and let the API sort
-        # it out rather than guess which one it honors.)
-        "reasoning_effort": "high",
+        # Leave sampling and reasoning at provider defaults for portability.
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    completion = client.chat.completions.create(**kwargs)
+    if reasoning_effort is not None:
+        if reasoning_effort not in ("low", "medium", "high"):
+            raise ValueError("Unsupported reasoning effort.")
+        kwargs["reasoning_effort"] = reasoning_effort
+
+    with _client() as client:
+        completion = client.chat.completions.create(**kwargs)
 
     # If the model hit its output-token limit, the reply is cut off mid-JSON and
     # will fail to parse. Say so plainly instead of letting a confusing parse

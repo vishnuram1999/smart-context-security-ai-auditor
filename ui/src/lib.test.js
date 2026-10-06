@@ -1,0 +1,151 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { callCount, charCount, filterFindings, isActive, modelIds, parseRoute, request, routeHref, validateModel, validateFiles, validateGithubPreview, validateGithubUrl } from './lib.js';
+
+test('model validation accepts provider IDs without requiring list membership', () => {
+  for (const id of ['gpt-model', 'provider/model:free', 'model.v1_2']) assert.equal(validateModel(id), null);
+  for (const id of ['', undefined, null, 123, 'bad model', 'bad\nmodel', 'bad\u0000model', 'bad\u007fmodel']) assert.ok(validateModel(id));
+  assert.deepEqual(modelIds({ models: [{ id: 'z' }, { id: 'a' }, { id: 'a' }] }), ['a', 'z']);
+  assert.deepEqual(modelIds({ models: [] }), []);
+  for (const data of [null, [], { models: null }, { models: [null] }, { models: [{ id: '' }] }, { models: [{ id: 'bad model' }] }]) assert.throws(() => modelIds(data), /invalid model list/);
+});
+test('model requests are bounded, cancellable, and hide provider error details', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalTimeout = AbortSignal.timeout;
+  const timeouts = [];
+  const controller = new AbortController();
+  try {
+    AbortSignal.timeout = (ms) => { timeouts.push(ms); return new AbortController().signal; };
+    globalThis.fetch = async (path, options) => {
+      assert.equal(path, '/api/models');
+      assert.equal(options.method, 'GET');
+      assert.equal(options.headers.Accept, 'application/json');
+      assert.ok(options.signal);
+      return Response.json({ detail: 'Authorization: Bearer sk-secret', error: 'https://key.example' }, { status: 502 });
+    };
+    await assert.rejects(request('/api/models', { signal: controller.signal }), (error) => /API 502.*hidden/.test(error.message) && !/sk-secret|key\.example|Bearer/.test(error.message));
+    assert.deepEqual(timeouts, [20000]);
+    AbortSignal.timeout = () => { const timeout = new AbortController(); timeout.abort(); return timeout.signal; };
+    globalThis.fetch = async (_path, { signal }) => signal.throwIfAborted();
+    await assert.rejects(request('/api/models'), /Model loading timed out.*manually/);
+    controller.abort();
+    await assert.rejects(request('/api/models', { signal: controller.signal }), { name: 'AbortError' });
+  } finally { globalThis.fetch = originalFetch; AbortSignal.timeout = originalTimeout; }
+});
+test('paid call counts include context only when used', () => {
+  assert.equal(callCount('single', 10), 1);
+  assert.equal(callCount('context', 10), 2);
+  assert.equal(callCount('loop', 1), 2);
+  assert.equal(callCount('loop', 10), 11);
+});
+test('history and examples have distinct, encoded routes', () => {
+  assert.deepEqual(parseRoute(routeHref('audit', 'job/a b')), { type: 'audit', id: 'job/a b' });
+  assert.deepEqual(parseRoute(routeHref('example', 'saved-1')), { type: 'example', id: 'saved-1' });
+  assert.deepEqual(parseRoute('#/new'), { type: 'new', id: null });
+  assert.deepEqual(parseRoute('#/audit/%E0%A4'), { type: 'new', id: null });
+});
+test('only queued and running jobs need polling', () => {
+  assert.ok(isActive({ status: 'queued' }));
+  assert.ok(isActive({ status: 'running' }));
+  assert.equal(isActive({ status: 'completed' }), false);
+  assert.equal(isActive({ status: 'failed' }), false);
+  assert.equal(isActive(null), false);
+});
+test('source validation catches unsafe, duplicate, empty and oversized uploads', () => {
+  const file = { path: 'src/Vault.sol', content: 'contract Vault {}' };
+  assert.equal(validateFiles([file], 100), null);
+  assert.match(validateFiles([], 100), /at least one/);
+  assert.match(validateFiles([{ ...file, path: 'secret.txt' }], 100), /Only Solidity/);
+  assert.match(validateFiles([{ ...file, path: '../Vault.sol' }], 100), /relative/);
+  assert.match(validateFiles([{ ...file, path: 'src\\..\\Vault.sol' }], 100), /relative/);
+  assert.match(validateFiles([{ ...file, path: '/Vault.sol' }], 100), /relative/);
+  assert.match(validateFiles([file, file], 100), /Duplicate path/);
+  assert.match(validateFiles([{ ...file, content: '' }], 100), /empty/);
+  assert.match(validateFiles([file], 3), /backend limit/);
+  assert.equal(charCount('x🛡'), 2);
+  assert.equal(validateFiles([{ ...file, content: 'x🛡' }], 2), null);
+});
+test('GitHub URLs accept only public HTTPS repository roots without credentials', () => {
+  for (const url of ['https://github.com/owner/repo', 'https://github.com/owner/repo/']) assert.equal(validateGithubUrl(url), null);
+  for (const url of ['', 'http://github.com/owner/repo', 'https://evil.example/owner/repo', 'https://token@github.com/owner/repo', 'https://github.com/owner/repo/tree/main', 'https://github.com/owner/repo?ref=main', 'https://github.com/owner/..']) assert.ok(validateGithubUrl(url), url);
+});
+test('GitHub preview validation requires a pinned, consistent Solidity snapshot', () => {
+  const preview = { id: 'preview-1', repository_url: 'https://github.com/owner/repo', repository: 'owner/repo', commit: 'a'.repeat(40), ref: 'main', subdirectory: '', file_count: 1, total_chars: 2, files: [{ path: 'Vault.sol', content: 'x🛡' }] };
+  assert.equal(validateGithubPreview(preview, 1000), null);
+  for (const change of [{ id: '' }, { commit: 'main' }, { files: null }, { files: [null] }, { file_count: 2 }, { total_chars: 3 }, { repository_url: 'javascript:alert(1)' }]) assert.ok(validateGithubPreview({ ...preview, ...change }, 1000));
+  assert.match(validateGithubPreview(preview, 1), /backend limit/);
+});
+test('preview requests use the optional timeout and existing CSRF helper', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalTimeout = AbortSignal.timeout;
+  const timeouts = [];
+  try {
+    AbortSignal.timeout = (ms) => { timeouts.push(ms); return new AbortController().signal; };
+    globalThis.fetch = async (path, options) => {
+      assert.equal(path, '/api/github/preview');
+      assert.equal(options.headers['X-Lucid-Request'], 'local-ui');
+      assert.deepEqual(JSON.parse(options.body), { url: 'https://github.com/owner/repo', ref: '', subdirectory: '' });
+      return Response.json({ id: 'preview-1' });
+    };
+    await request('/api/github/preview', { method: 'POST', body: { url: 'https://github.com/owner/repo', ref: '', subdirectory: '' }, timeoutMs: 75000 });
+    await request('/api/github/preview', { method: 'POST', body: { url: 'https://github.com/owner/repo', ref: '', subdirectory: '' } });
+    assert.deepEqual(timeouts, [75000, 20000]);
+  } finally { globalThis.fetch = originalFetch; AbortSignal.timeout = originalTimeout; }
+});
+test('finding search includes all evidence fields and composes with severity', () => {
+  const findings = [
+    { title: 'Reentrancy', severity: 'high', location: 'Vault.sol:4', description: 'External call', impact: 'Drain', exploit_steps: ['Deploy a receiver'] },
+    { title: 'Rounding', severity: 'medium', location: 'Pool.sol:9', description: 'Division', impact: 'Dust', exploit_steps: ['Deposit'] },
+  ];
+  assert.equal(filterFindings(findings, 'all', ' RECEIVER ').length, 1);
+  assert.equal(filterFindings(findings, 'medium', 'receiver').length, 0);
+  assert.equal(filterFindings(findings, 'all', 'pool.sol').length, 1);
+  assert.equal(filterFindings(findings, 'high', '').length, 1);
+});
+test('POST requests enforce the CSRF header and carry confirmation', async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = async (path, options) => {
+      assert.equal(path, '/api/audits');
+      assert.equal(options.headers['X-Lucid-Request'], 'local-ui');
+      assert.equal(options.headers['Content-Type'], 'application/json');
+      assert.equal(options.credentials, 'same-origin');
+      assert.equal(JSON.parse(options.body).confirmed_paid, true);
+      return new Response(JSON.stringify({ id: 'job-1', status: 'queued' }));
+    };
+    assert.equal((await request('/api/audits', { method: 'POST', body: { confirmed_paid: true } })).id, 'job-1');
+  } finally { globalThis.fetch = original; }
+});
+test('API errors are actionable and do not display proxy HTML', async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ detail: 'Invalid origin' }), { status: 403 });
+    await assert.rejects(request('/api/audits'), /Invalid origin.*CSRF/);
+    globalThis.fetch = async () => new Response('<html>proxy error</html>', { status: 502 });
+    await assert.rejects(request('/api/config'), /API 502.*backend logs/);
+    globalThis.fetch = async () => new Response('<html>not JSON</html>');
+    await assert.rejects(request('/api/config'), /no JSON data/);
+    globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+    await assert.rejects(request('/api/config'), /127\.0\.0\.1:8765/);
+  } finally { globalThis.fetch = original; }
+});
+test('preview timeout and API errors do not ask for provider keys or paid retries', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalTimeout = AbortSignal.timeout;
+  try {
+    globalThis.fetch = async () => Response.json({ detail: 'Repository not found' }, { status: 404 });
+    await assert.rejects(request('/api/github/preview'), /Repository not found.*public repository.*No model calls/);
+    AbortSignal.timeout = () => { const controller = new AbortController(); controller.abort(); return controller.signal; };
+    globalThis.fetch = async (_path, { signal }) => signal.throwIfAborted();
+    await assert.rejects(request('/api/github/preview', { timeoutMs: 75000 }), /preview timed out.*No model calls/);
+  } finally { globalThis.fetch = originalFetch; AbortSignal.timeout = originalTimeout; }
+});
+test('aborted requests preserve cancellation instead of reporting connectivity errors', async () => {
+  const original = globalThis.fetch;
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    globalThis.fetch = async (_path, { signal }) => { signal.throwIfAborted(); };
+    await assert.rejects(request('/api/config', { signal: controller.signal }), { name: 'AbortError' });
+  } finally { globalThis.fetch = original; }
+});
