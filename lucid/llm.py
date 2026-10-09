@@ -14,13 +14,38 @@ import re
 
 from openai import OpenAI
 
+from . import kiro
+
 # Legacy course default. Availability is provider-dependent; prefer an explicit
 # OPENAI_MODEL or a per-audit selection from the provider's current catalog.
 MODEL = "openai/gpt-5.6-luna"
 
 
-def default_model() -> str:
-    """Resolve the environment default without mutating global model state."""
+def provider_kind(provider: str | None = None) -> str:
+    """Resolve a request override; auto uses the backend's configured default.
+
+    Never fall back after a failed paid call. Omitted overrides preserve CLI
+    configuration, while api/kiro override it without changing the environment.
+    """
+    if provider is not None and provider not in ("auto", "api", "kiro"):
+        raise ValueError("Provider must be auto, api, or kiro.")
+    configured = (os.environ.get("LUCID_PROVIDER", "auto").strip().lower()
+                  if provider in (None, "auto") else provider)
+    if configured not in ("auto", "api", "kiro"):
+        raise ValueError("LUCID_PROVIDER must be auto, api, or kiro.")
+    if configured != "auto":
+        return configured
+    return "api" if os.environ.get("OPENAI_API_KEY") or not kiro.executable() else "kiro"
+
+
+def provider_ready(provider: str | None = None) -> bool:
+    return bool(kiro.executable()) if provider_kind(provider) == "kiro" else bool(os.environ.get("OPENAI_API_KEY"))
+
+
+def default_model(provider: str | None = None) -> str:
+    """Kiro defaults are separate so stale Requesty model IDs aren't reused."""
+    if provider_kind(provider) == "kiro":
+        return validate_model(os.environ.get("LUCID_KIRO_MODEL", kiro.DEFAULT_MODEL))
     return validate_model(os.environ.get("OPENAI_MODEL", MODEL))
 
 
@@ -51,8 +76,10 @@ def _client(*, timeout: float = 600.0) -> OpenAI:
     return OpenAI(api_key=api_key, timeout=timeout, max_retries=0)
 
 
-def list_models() -> list[dict[str, str]]:
+def list_models(provider: str | None = None) -> list[dict[str, str]]:
     """List IDs only, without forwarding provider metadata or invoking inference."""
+    if provider_kind(provider) == "kiro":
+        return kiro.list_models()
     with _client(timeout=10.0) as client:
         page = client.models.list()
     ids = set()
@@ -67,6 +94,7 @@ def list_models() -> list[dict[str, str]]:
 def complete(
     system: str, user: str, json_mode: bool = True, *,
     model: str | None = None, reasoning_effort: str | None = None,
+    provider: str | None = None,
 ) -> str:
     """Send one system + one user message to the model and return the reply text.
 
@@ -77,18 +105,23 @@ def complete(
                    makes parsing far more reliable than free-form text.
         model:     per-call model ID; defaults to OPENAI_MODEL or the course fallback.
         reasoning_effort: optional provider-specific reasoning control.
+        provider: optional auto/api/kiro override; credentials remain backend-only.
 
     Returns:
         The raw text of the model's reply. Parsing is a separate step so the
         caller can decide what to do with it.
     """
+    kind = provider_kind(provider)
+    if kind == "kiro":
+        return kiro.complete(system, user, model=model if model is not None else default_model(kind),
+                             json_mode=json_mode, reasoning_effort=reasoning_effort)
     # Build the call arguments. JSON mode tells the API "the reply MUST be a
     # valid JSON object", which removes a whole class of parsing headaches. Not
     # every model supports it, so it stays optional — and we only add the
     # response_format key when we actually want it. Passing response_format=None
     # trips up some OpenAI-compatible gateways, so we leave it out entirely.
     kwargs = {
-        "model": validate_model(model) if model is not None else default_model(),
+        "model": validate_model(model) if model is not None else default_model(kind),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},

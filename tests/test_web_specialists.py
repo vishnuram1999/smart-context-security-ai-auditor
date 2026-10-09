@@ -34,6 +34,9 @@ def response(*findings):
 
 class SpecialistStoreTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, {"LUCID_PROVIDER": "api"})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.store = AuditStore()
         self.addCleanup(self.store.executor.shutdown, wait=True)
         self.addCleanup(self.store.close)
@@ -102,13 +105,13 @@ class SpecialistStoreTests(unittest.TestCase):
             self.assertEqual(self.store.get(initial["id"])["lanes"][0]["status"], "completed")
             release_judge.set()
             job = self.wait(initial["id"])
-            build.assert_called_once_with("SOURCE", model=OPTIONS["model"], reasoning_effort="high")
+            build.assert_called_once_with("SOURCE", model=OPTIONS["model"], reasoning_effort="high", provider="api")
             permissive.assert_not_called()
             general.assert_not_called()
             upstream_judge.assert_not_called()
             self.assertEqual(mocked.call_count, 13)
             for call in mocked.call_args_list:
-                self.assertEqual(call.kwargs, OPTIONS)
+                self.assertEqual(call.kwargs, OPTIONS | {"provider": "api"})
             judge_prompt = mocked.call_args_list[-1].args[1]
             for key in KEYS:
                 self.assertIn(f"candidate::{key}", judge_prompt)
@@ -120,7 +123,7 @@ class SpecialistStoreTests(unittest.TestCase):
         for key, index, prompt, options in calls:
             self.assertIn("SOURCE", prompt)
             self.assertIn("SHARED CONTEXT", prompt)
-            self.assertEqual(options, OPTIONS)
+            self.assertEqual(options, OPTIONS | {"provider": "api"})
             if index == 0:
                 self.assertNotIn("candidate::", prompt)
             else:
@@ -311,10 +314,10 @@ class SpecialistStoreTests(unittest.TestCase):
             self.assertTrue(all(lane["status"] == "queued" for lane in pending["lanes"]))
             release.set()
             job = self.wait(initial["id"])
-            context_build.assert_called_once_with("SOURCE", model="provider/pinned-default", reasoning_effort=None)
+            context_build.assert_called_once_with("SOURCE", model="provider/pinned-default", reasoning_effort=None, provider="api")
             self.assertEqual(mocked.call_count, 7)
             for call in mocked.call_args_list:
-                self.assertEqual(call.kwargs, {"model": "provider/pinned-default", "json_mode": True, "reasoning_effort": None})
+                self.assertEqual(call.kwargs, {"model": "provider/pinned-default", "json_mode": True, "reasoning_effort": None, "provider": "api"})
         self.assertEqual(job["status"], "completed")
         self.assertEqual(job["judge_status"], "completed")
         self.assertEqual(job["findings"], [])
@@ -340,6 +343,9 @@ class SpecialistStoreTests(unittest.TestCase):
 
 class SpecialistAPITests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, {"LUCID_PROVIDER": "api"})
+        environment.start()
+        self.addCleanup(environment.stop)
         client_context = TestClient(app, base_url="http://localhost:8765")
         self.client = client_context.__enter__()
         self.addCleanup(client_context.__exit__, None, None, None)
@@ -394,7 +400,7 @@ class SpecialistAPITests(unittest.TestCase):
                 for call in mocked.call_args_list:
                     self.assertIn(source, call.args[1])
                     self.assertNotIn("MUTATED AFTER PREVIEW", call.args[1])
-                    self.assertEqual(call.kwargs, OPTIONS)
+                    self.assertEqual(call.kwargs, OPTIONS | {"provider": "api"})
                 if target["target"] == "github":
                     self.assertEqual(job["source"]["commit"], "a" * 40)
                     self.assertEqual(job["target"], "owner/repo")
@@ -402,6 +408,48 @@ class SpecialistAPITests(unittest.TestCase):
         history = self.client.get("/api/audits").json()
         self.assertTrue(all("findings_by_lane" not in item for item in history))
         self.assertTrue(all(item["findings_count"] == 1 for item in history))
+
+    def test_provider_is_pinned_for_context_all_lanes_and_judge(self):
+        for selection in (None, "auto", "api", "kiro"):
+            with self.subTest(selection=selection):
+                entered, release = Event(), Event()
+                self.addCleanup(release.set)
+                def complete(system, prompt, *, entered=entered, release=release, **options):
+                    if system == context.CONTEXT_SYSTEM_PROMPT:
+                        entered.set()
+                        if not release.wait(5):
+                            raise RuntimeError("Test context timed out")
+                        return "Context"
+                    return response(FINDING)
+                kind = "kiro" if selection == "kiro" else "api"
+                with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": "fake", "OPENAI_MODEL": "api/default", "LUCID_KIRO_MODEL": "kiro-default"}), patch("lucid.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.kiro.resolve_model", return_value="kiro/pinned") as resolve, patch("lucid.web.llm.complete", side_effect=complete) as mocked:
+                    settings = {} if selection is None else {"provider": selection}
+                    result = self.client.post("/api/audits", headers=HEADERS, json={
+                        "confirmed_paid": True, "mode": "specialists", "rounds": 2,
+                        "target": "upload", "files": [{"path": "A.sol", "content": "contract A {}"}],
+                        **settings,
+                    })
+                    self.assertEqual(result.status_code, 202)
+                    self.assertTrue(entered.wait(5))
+                    # A different dropdown query and changed defaults cannot reroute a job.
+                    other = "api" if kind == "kiro" else "kiro"
+                    self.assertEqual(self.client.get(f"/api/config?provider={other}").json()["provider_kind"], other)
+                    with patch.dict(os.environ, {"LUCID_PROVIDER": other, "OPENAI_MODEL": "changed/default", "LUCID_KIRO_MODEL": "changed/default"}):
+                        release.set()
+                        job = self.wait(result.json()["id"])
+                    self.assertEqual(job["status"], "completed")
+                    self.assertEqual(job["provider_kind"], kind)
+                    self.assertEqual(job["model"], "kiro/pinned" if kind == "kiro" else "api/default")
+                    self.assertEqual(mocked.call_count, 14)
+                    self.assertEqual(mocked.call_args_list[0].args[0], context.CONTEXT_SYSTEM_PROMPT)
+                    self.assertEqual(mocked.call_args_list[-1].args[0], judge.JUDGE_SYSTEM_PROMPT)
+                    for call in mocked.call_args_list:
+                        self.assertEqual(call.kwargs["provider"], kind)
+                        self.assertEqual(call.kwargs["model"], job["model"])
+                    if kind == "kiro":
+                        resolve.assert_called_once_with("kiro-default")
+                    else:
+                        resolve.assert_not_called()
 
     def test_round_bounds_and_request_default(self):
         self.assertEqual(AuditRequest(mode="specialists").rounds, 5)

@@ -48,6 +48,7 @@ designed to guarantee.
 
 def build_context(
     codebase: str, *, model: str | None = None, reasoning_effort: str | None = None,
+    provider: str | None = None,
 ) -> str:
     """Run the context-builder pass over a codebase blob and return the raw text.
 
@@ -60,7 +61,8 @@ def build_context(
         model call, not parsed.
     """
     user_prompt = CONTEXT_USER_PROMPT_TEMPLATE.format(codebase=codebase)
+    options = {"provider": provider} if provider is not None else {}
     return llm.complete(
-            CONTEXT_SYSTEM_PROMPT, user_prompt, json_mode=False,
-            model=model, reasoning_effort=reasoning_effort,
-        )
+        CONTEXT_SYSTEM_PROMPT, user_prompt, json_mode=False,
+        model=model, reasoning_effort=reasoning_effort, **options,
+    )

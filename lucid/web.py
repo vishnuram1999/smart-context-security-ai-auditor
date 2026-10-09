@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import agent, context, judge, llm, specialists
+from . import agent, context, judge, kiro, llm, specialists
 from .codebase import MAX_CHARS, load_codebase
 from .github import GitHubSourceError, fetch_repository
 from .schema import Finding
@@ -42,6 +42,8 @@ ALLOWED_ORIGINS = {
 
 def provider_error(exc: Exception) -> str:
     """Expose only SDK error categories/status codes, never provider text or bodies."""
+    if isinstance(exc, kiro.KiroError):
+        return str(exc)
     if isinstance(exc, openai.APIStatusError):
         messages = {
             400: "Provider rejected the request (HTTP 400). Check model support, JSON/reasoning settings, and context size.",
@@ -72,6 +74,7 @@ class AuditRequest(BaseModel):
     mode: Literal["single", "context", "loop", "specialists"] = "single"
     rounds: int = Field(default=5, ge=1, le=10)
     confirmed_paid: bool = False
+    provider: Literal["auto", "api", "kiro"] = "auto"
     model: str | None = Field(default=None, max_length=256)
     json_mode: bool = True
     reasoning_effort: Literal["low", "medium", "high"] | None = None
@@ -235,7 +238,15 @@ class AuditStore:
             ]))
 
     def start(self, request: AuditRequest, codebase: str, source: dict | None = None) -> dict:
-        model = request.model if request.model is not None else llm.default_model()
+        provider = llm.provider_kind(request.provider)
+        model = request.model if request.model is not None else llm.default_model(provider)
+        if provider == "kiro":
+            if request.reasoning_effort is not None:
+                raise HTTPException(400, "Kiro ACP does not support the reasoning effort option. Use provider default; no audit prompt was sent.")
+            try:
+                model = kiro.resolve_model(model)
+            except kiro.KiroError as exc:
+                raise HTTPException(400, str(exc)) from None
         with self.lock:
             if any(job["status"] in ("queued", "running") for job in self.jobs.values()):
                 raise HTTPException(409, "An audit is already running. Wait for it to finish.")
@@ -248,7 +259,7 @@ class AuditStore:
                 "mode": request.mode, "rounds": rounds, "completed_rounds": 0,
                 "findings": [], "context": None, "error": None, "warnings": [],
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "model": model,
+                "model": model, "provider_kind": provider,
                 "json_mode": request.json_mode, "reasoning_effort": request.reasoning_effort,
                 "target": source["repository"] if source else "SecondSwap" if request.target == "bundled" else "Uploaded contracts",
                 "source": source,
@@ -267,7 +278,7 @@ class AuditStore:
             self.jobs[job_id] = job
         self.executor.submit(
                     self.run, job_id, codebase, request.mode, rounds,
-                    model, request.json_mode, request.reasoning_effort,
+                    model, request.json_mode, request.reasoning_effort, provider=provider,
                 )
         return self.get(job_id)
 
@@ -299,9 +310,12 @@ class AuditStore:
     def run_specialists(
         self, job_id: str, codebase: str, protocol_context: str, rounds: int,
         model: str, json_mode: bool, reasoning_effort: str | None,
+        *, provider: str | None = None,
     ):
         stop = Event()
         options = {"model": model, "json_mode": json_mode, "reasoning_effort": reasoning_effort}
+        if provider is not None:
+            options["provider"] = provider
 
         def run_lane(key: str):
             findings = []
@@ -375,7 +389,9 @@ class AuditStore:
     def run(
         self, job_id: str, codebase: str, mode: str, rounds: int,
         model: str, json_mode: bool, reasoning_effort: str | None,
+        *, provider: str | None = None,
     ):
+        options = {"provider": provider} if provider is not None else {}
         try:
             self.check_shutdown()
             self.update(job_id, status="running", stage="Preparing audit")
@@ -384,7 +400,7 @@ class AuditStore:
                 self.update(job_id, stage="Building protocol context")
                 self.check_shutdown()
                 protocol_context = context.build_context(
-                                    codebase, model=model, reasoning_effort=reasoning_effort,
+                                    codebase, model=model, reasoning_effort=reasoning_effort, **options,
                                 )
                 if not protocol_context.strip():
                     raise AuditOutputError("Model returned an empty protocol context. Retry the audit.")
@@ -392,6 +408,7 @@ class AuditStore:
             if mode == "specialists":
                 self.run_specialists(
                     job_id, codebase, protocol_context, rounds, model, json_mode, reasoning_effort,
+                    **options,
                 )
                 self.update(job_id, status="completed", stage="Audit complete")
                 return
@@ -412,7 +429,7 @@ class AuditStore:
                 self.check_shutdown()
                 new, notices = parse_findings(llm.complete(
                                     agent.SYSTEM_PROMPT, prompt, json_mode=json_mode,
-                                    model=model, reasoning_effort=reasoning_effort,
+                                    model=model, reasoning_effort=reasoning_effort, **options,
                                 ))
                 findings.extend(new)
                 warnings.extend(f"Round {index + 1}: {notice}" for notice in notices)
@@ -474,27 +491,40 @@ async def local_requests(request: Request, call_next):
 
 
 @app.get("/api/config")
-def config():
+def config(provider: Literal["auto", "api", "kiro"] = "auto"):
     from urllib.parse import urlparse
     base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")
+    try:
+        kind = llm.provider_kind(provider)
+        ready = llm.provider_ready(kind)
+    except ValueError:
+        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, or kiro.") from None
     return {
-        "model": os.environ.get("OPENAI_MODEL", llm.MODEL), "provider": urlparse(base).hostname or "custom provider",
+        "model": os.environ.get("LUCID_KIRO_MODEL", kiro.DEFAULT_MODEL) if kind == "kiro" else os.environ.get("OPENAI_MODEL", llm.MODEL),
+        "provider": "Kiro CLI (ACP)" if kind == "kiro" else urlparse(base).hostname or "custom provider",
+        "provider_kind": kind, "provider_ready": ready,
         "key_configured": bool(os.environ.get("OPENAI_API_KEY")),
+        "reasoning_supported": kind != "kiro",
         "default_target": "SecondSwap", "default_file_count": len(list(TARGET.rglob("*.sol"))),
         "max_chars": MAX_CHARS,
     }
 
 
 @app.get("/api/models")
-def models():
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise HTTPException(400, "Configure OPENAI_API_KEY on the backend to load provider models. Manual model selection is still available.")
+def models(provider: Literal["auto", "api", "kiro"] = "auto"):
     try:
-        return {"models": llm.list_models()}
+        kind = llm.provider_kind(provider)
+    except ValueError:
+        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, or kiro.") from None
+    if not llm.provider_ready(kind):
+        raise HTTPException(400, "Configure OPENAI_API_KEY or install and sign in to Kiro CLI on the backend.")
+    try:
+        return {"models": llm.list_models(provider=kind)}
     except Exception as exc:  # Never expose provider exception details.
         return JSONResponse(status_code=502, content={
             "detail": f"Could not load provider models. {provider_error(exc)} No inference was requested.",
             "provider_status": exc.status_code if isinstance(exc, openai.APIStatusError) else None,
+            "provider_error_code": "kiro" if isinstance(exc, kiro.KiroError) else None,
         })
 
 
@@ -530,8 +560,12 @@ def preview_github(body: GitHubPreviewRequest, request: Request):
 def create_audit(body: AuditRequest, request: Request):
     if not body.confirmed_paid:
         raise HTTPException(400, "Confirm paid API usage and source sharing before starting.")
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise HTTPException(400, "Set OPENAI_API_KEY in the backend .env file, then restart the server.")
+    try:
+        kind = llm.provider_kind(body.provider)
+    except ValueError:
+        raise HTTPException(400, "LUCID_PROVIDER must be auto, api, or kiro.") from None
+    if not llm.provider_ready(kind):
+        raise HTTPException(400, "Configure OPENAI_API_KEY or install and sign in to Kiro CLI on the backend, then restart.")
     source = None
     try:
         if body.target == "github":

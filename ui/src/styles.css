@@ -131,13 +131,14 @@ h3 { font-size: 13px; font-weight: 600; }
 .source-review pre { margin: 0; padding: 12px 0; border-top: 1px solid var(--border); max-height: 420px; overflow: auto; font-size: 11px; line-height: 1.8; tab-size: 4; }
 .source-line { display: flex; min-width: max-content; padding-right: 16px; }
 .line-number { min-width: 5ch; padding: 0 12px; margin-right: 12px; text-align: right; color: var(--muted); border-right: 1px solid var(--border); user-select: none; }
+.model-controls { display: grid; gap: 20px; }
 .model-picker { display: flex; align-items: flex-end; gap: 16px; }
 .model-picker label { flex: 1; min-width: 0; }
 .model-picker label, .model-options label { display: grid; gap: 8px; font-size: 11px; }
 .model-picker input, .model-options select { width: 100%; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 4px; background: #1b1d20; font-size: 12px; }
 .model-picker input::placeholder { color: var(--muted); }
 .model-picker input[aria-invalid="true"] { border-color: #9b4b64; }
-.model-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 20px; }
+.model-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .model-help { color: var(--muted); font-size: 11px; line-height: 1.8; margin-top: 16px; }
 .model-panel fieldset:disabled { opacity: .6; }
 @media (max-width: 650px) { .model-picker { align-items: stretch; flex-direction: column; } .model-options { grid-template-columns: 1fr; } }

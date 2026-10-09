@@ -74,7 +74,7 @@ export function modelIds(data) {
 export async function request(path, { signal, method = 'GET', body, timeoutMs = 20000 } = {}) {
   const timeout = AbortSignal.timeout(timeoutMs);
   const githubPreview = path === '/api/github/preview';
-  const modelsRequest = path === '/api/models';
+  const modelsRequest = path.split('?')[0] === '/api/models';
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let response;
   try {
@@ -107,6 +107,7 @@ export async function request(path, { signal, method = 'GET', body, timeoutMs = 
         [503, 'Provider service failed (HTTP 503). Check provider service status.'],
         [504, 'Provider service timed out (HTTP 504). Try loading models later.'],
       ]).get(data?.provider_status);
+      if (data?.provider_error_code === 'kiro') throw new Error(`API ${response.status}: Could not load Kiro models. Check Kiro CLI installation and run kiro-cli login on the backend. The CLI must support ACP and expose a model catalog. No inference was requested.`);
       throw new Error(`API ${response.status}: Could not load models. ${advice || 'Check the backend and provider configuration, or enter a model ID manually. Provider error details are hidden.'} No inference was requested.`);
     }
     const detail = typeof data?.detail === 'string' ? data.detail : typeof data?.error === 'string' ? data.error : Array.isArray(data?.detail) ? data.detail.map((item) => item.msg).join('; ') : '';

@@ -14,6 +14,73 @@ const code = transformed.code.replace(/from "([^"]+)"|from '([^']+)'/g, (_match,
 });
 const { default: App } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 
+test('Kiro CLI enables keyless audits, uses its catalog, and disables unsupported reasoning', async () => {
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
+  const originalFetch = globalThis.fetch;
+  const originals = new Map();
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, IS_REACT_ACT_ENVIRONMENT: true })) {
+    originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
+  }
+  const calls = [];
+  let pendingKiro;
+  let deferKiro = false;
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options });
+    if (path === '/api/models?provider=kiro' && deferKiro) return new Promise((resolve) => { pendingKiro = resolve; });
+    if (path === '/api/config' || path === '/api/config?provider=kiro') return Response.json({ model: 'kiro-default', provider: 'Kiro CLI (ACP)', provider_kind: 'kiro', provider_ready: true, key_configured: false, max_chars: 1000 });
+    if (path === '/api/config?provider=api') return Response.json({ model: 'api-model', provider: 'api-provider', provider_kind: 'api', provider_ready: true, key_configured: true, max_chars: 1000 });
+    if (path === '/api/models' || path === '/api/models?provider=kiro') return Response.json({ models: [{ id: 'kiro-model' }] });
+    if (path === '/api/audits' && options.method !== 'POST') return Response.json([]);
+    return Response.json({ id: 'kiro-job', status: 'completed', findings: [], provider_kind: 'kiro', model: 'kiro-model' });
+  };
+  const root = createRoot(document.getElementById('root'));
+  const flush = async (fn = () => {}) => act(async () => { fn(); await new Promise((resolve) => setTimeout(resolve, 30)); });
+  const button = (text) => [...document.querySelectorAll('button')].find((element) => element.textContent.includes(text));
+  try {
+    await flush(() => root.render(React.createElement(App)));
+    assert.match(document.body.textContent, /Detected · login required/);
+    assert.match(document.body.textContent, /Kiro subscription credits/);
+    assert.equal(document.getElementById('reasoning-effort').disabled, true);
+    assert.equal(document.getElementById('paid-consent').disabled, false);
+    assert.equal(calls.some((call) => call.path === '/api/models'), false);
+    await flush(() => button('Load models').click());
+    assert.equal(document.querySelector('#available-models option').value, 'kiro-model');
+    const edit = async (id, value) => flush(() => {
+      const input = document.getElementById(id);
+      const propsKey = Object.keys(input).find((key) => key.startsWith('__reactProps$'));
+      input[propsKey].onChange({ target: { value } });
+    });
+    await flush(() => document.getElementById('paid-consent').click());
+    await edit('audit-provider', 'api');
+    assert.equal(document.getElementById('paid-consent').checked, false);
+    assert.equal(document.getElementById('audit-model').value, '');
+    deferKiro = true;
+    await edit('audit-provider', 'kiro');
+    assert.equal(document.getElementById('kiro-model').disabled, true);
+    await edit('audit-provider', 'api');
+    assert.equal(calls.findLast((call) => call.path === '/api/models?provider=kiro').options.signal.aborted, true);
+    await flush(() => pendingKiro(Response.json({ models: [{ id: 'stale-kiro-model' }] })));
+    assert.equal(document.querySelector('#available-models option'), null, 'stale Kiro catalog is ignored');
+    deferKiro = false;
+    await edit('audit-provider', 'kiro');
+    assert.ok(calls.some((call) => call.path === '/api/models?provider=kiro'), 'Kiro selection automatically fetches models');
+    assert.equal(document.querySelector('#kiro-model option[value="kiro-model"]').textContent, 'kiro-model');
+    await edit('kiro-model', 'kiro-model');
+    await flush(() => document.getElementById('paid-consent').click());
+    assert.equal(button('Start live audit').disabled, false);
+    await flush(() => button('Start live audit').click());
+    const body = JSON.parse(calls.find((call) => call.path === '/api/audits' && call.options.method === 'POST').options.body);
+    assert.equal(body.model, 'kiro-model');
+    assert.equal(body.provider, 'kiro');
+    assert.equal(body.reasoning_effort, null);
+  } finally {
+    await act(async () => root.unmount());
+    dom.window.close(); globalThis.fetch = originalFetch;
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; }
+  }
+});
+
 test('specialists forward all sources and settings, lock submission, and separate lane candidates from judged reports', async () => {
   const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
   const originalFetch = globalThis.fetch;

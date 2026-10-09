@@ -45,6 +45,15 @@ test('model errors show only allowlisted provider status guidance', async () => 
     }
   } finally { globalThis.fetch = originalFetch; }
 });
+test('provider-specific model requests preserve error redaction', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => Response.json({ detail: 'sk-secret', provider_error_code: 'kiro' }, { status: 502 });
+    await assert.rejects(request('/api/models?provider=kiro'), (error) => /kiro-cli login/.test(error.message) && !/sk-secret/.test(error.message));
+    globalThis.fetch = async () => Response.json({ detail: 'sk-secret', provider_status: 403 }, { status: 502 });
+    await assert.rejects(request('/api/models?provider=api'), (error) => /HTTP 403/.test(error.message) && !/sk-secret/.test(error.message));
+  } finally { globalThis.fetch = originalFetch; }
+});
 test('paid call counts include context only when used', () => {
   assert.equal(callCount('single', 10), 1);
   assert.equal(callCount('context', 10), 2);

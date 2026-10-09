@@ -33,6 +33,9 @@ FINDING = {
 
 class WebTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, {"LUCID_PROVIDER": "api"})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.client_context = TestClient(app, base_url="http://localhost:8765")
         self.client = self.client_context.__enter__()
 
@@ -54,6 +57,95 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(config))
         self.assertEqual(self.client.get("/api/examples").status_code, 404)
         self.assertEqual(self.client.get("/api/examples/run-1").status_code, 404)
+
+    def test_keyless_kiro_config_catalog_and_pinned_audit(self):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": "", "OPENAI_MODEL": "stale/requesty"}), patch("lucid.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.kiro.list_models", return_value=[{"id": "kiro-model"}]), patch("lucid.kiro.resolve_model", return_value="kiro-model") as resolve, patch("lucid.kiro.complete", return_value='{"findings": []}') as complete:
+            config = self.client.get("/api/config").json()
+            self.assertEqual(config["provider_kind"], "kiro")
+            self.assertFalse(config["key_configured"])
+            self.assertTrue(config["provider_ready"])
+            self.assertEqual(config["model"], "kiro-default")
+            self.assertEqual(self.client.get("/api/models").json(), {"models": [{"id": "kiro-model"}]})
+            complete.assert_not_called()
+            response = self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True, "mode": "single", "reasoning_effort": "high"})
+            self.assertEqual(response.status_code, 400)
+            resolve.assert_not_called()
+            complete.assert_not_called()
+            response = self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True, "mode": "single"})
+            self.assertEqual(response.status_code, 202)
+            job = self.wait(response.json()["id"])
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["model"], "kiro-model")
+            self.assertEqual(job["provider_kind"], "kiro")
+            self.assertEqual(complete.call_args.kwargs["model"], "kiro-model")
+            resolve.assert_called_once_with("kiro-default")
+
+    def test_explicit_kiro_with_api_key_uses_selected_metadata_and_preflight(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fake", "OPENAI_MODEL": "stale/api", "LUCID_KIRO_MODEL": "kiro-default"}), patch("lucid.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.kiro.list_models", return_value=[{"id": "kiro/model"}]) as catalog, patch("lucid.kiro.resolve_model", return_value="kiro/model") as resolve, patch("lucid.kiro.complete", return_value='{"findings": []}') as complete, patch("lucid.llm._client") as api:
+            before = dict(os.environ)
+            config = self.client.get("/api/config?provider=kiro").json()
+            self.assertEqual(config["provider_kind"], "kiro")
+            self.assertEqual(config["model"], "kiro-default")
+            self.assertEqual(config["provider"], "Kiro CLI (ACP)")
+            self.assertTrue(config["key_configured"])
+            self.assertTrue(config["provider_ready"])
+            self.assertFalse(config["reasoning_supported"])
+            catalog.assert_not_called()
+            resolve.assert_not_called()
+            self.assertEqual(self.client.get("/api/models?provider=kiro").json(), {"models": [{"id": "kiro/model"}]})
+            complete.assert_not_called()
+            body = {"confirmed_paid": True, "provider": "kiro"}
+            rejected = self.client.post("/api/audits", headers=HEADERS, json=body | {"reasoning_effort": "high"})
+            self.assertEqual(rejected.status_code, 400)
+            resolve.assert_not_called()
+            complete.assert_not_called()
+            started = self.client.post("/api/audits", headers=HEADERS, json=body)
+            self.assertEqual(started.status_code, 202)
+            job = self.wait(started.json()["id"])
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["provider_kind"], "kiro")
+            self.assertEqual(job["model"], "kiro/model")
+            resolve.assert_called_once_with("kiro-default")
+            api.assert_not_called()
+            self.assertEqual(self.client.get("/api/config").json()["provider_kind"], "api")
+            self.assertEqual(dict(os.environ), before)
+
+    def test_explicit_api_without_key_never_falls_back_to_kiro(self):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": "", "OPENAI_MODEL": "api/default"}), patch("lucid.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.kiro.list_models") as catalog, patch("lucid.kiro.resolve_model") as resolve, patch("lucid.kiro.complete") as complete, patch("lucid.llm._client") as api:
+            config = self.client.get("/api/config?provider=api").json()
+            self.assertEqual(config["provider_kind"], "api")
+            self.assertFalse(config["provider_ready"])
+            self.assertEqual(config["model"], "api/default")
+            self.assertTrue(config["reasoning_supported"])
+            self.assertEqual(self.client.get("/api/models?provider=api").status_code, 400)
+            self.assertEqual(self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True, "provider": "api"}).status_code, 400)
+            catalog.assert_not_called()
+            resolve.assert_not_called()
+            complete.assert_not_called()
+            api.assert_not_called()
+
+    def test_provider_queries_validate_and_dispatch_without_inference(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fake"}), patch("lucid.web.llm.list_models", return_value=[{"id": "api/model"}]) as catalog, patch("lucid.web.llm.complete") as complete:
+            for selection in ("api", "auto"):
+                self.assertEqual(self.client.get(f"/api/models?provider={selection}").json(), {"models": [{"id": "api/model"}]})
+                self.assertEqual(catalog.call_args.kwargs, {"provider": "api"})
+            for invalid in ("unknown", "API", ""):
+                self.assertEqual(self.client.get(f"/api/config?provider={invalid}").status_code, 422)
+                self.assertEqual(self.client.get(f"/api/models?provider={invalid}").status_code, 422)
+                self.assertEqual(self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True, "provider": invalid}).status_code, 422)
+            self.assertEqual(catalog.call_count, 2)
+            complete.assert_not_called()
+
+    def test_kiro_login_failure_is_safe_and_never_starts_inference(self):
+        from lucid.kiro import KiroError
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": ""}), patch("lucid.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.kiro.resolve_model", side_effect=KiroError("Kiro ACP request failed. Check CLI authentication, model access, and configuration.")), patch("lucid.kiro.list_models", side_effect=KiroError("Kiro operation timed out.")), patch("lucid.kiro.complete") as complete:
+            catalog = self.client.get("/api/models")
+            self.assertEqual(catalog.status_code, 502)
+            self.assertEqual(catalog.json()["provider_error_code"], "kiro")
+            response = self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("authentication", response.json()["detail"])
+            complete.assert_not_called()
 
     def test_request_guards(self):
         body = {"confirmed_paid": True}
@@ -297,10 +389,10 @@ class WebTests(unittest.TestCase):
             self.assertEqual(job["model"], "provider/selected")
             self.assertFalse(job["json_mode"])
             self.assertEqual(job["reasoning_effort"], "medium")
-            self.assertEqual(build.call_args.kwargs, {"model": "provider/selected", "reasoning_effort": "medium"})
+            self.assertEqual(build.call_args.kwargs, {"model": "provider/selected", "reasoning_effort": "medium", "provider": "api"})
             self.assertEqual(complete.call_count, 2)
             for call in complete.call_args_list:
-                self.assertEqual(call.kwargs, {"model": "provider/selected", "json_mode": False, "reasoning_effort": "medium"})
+                self.assertEqual(call.kwargs, {"model": "provider/selected", "json_mode": False, "reasoning_effort": "medium", "provider": "api"})
 
     def test_invalid_model_settings_never_start_inference(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "fake"}), patch("lucid.web.llm.complete") as complete:

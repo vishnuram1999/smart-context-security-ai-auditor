@@ -7,38 +7,40 @@ which model is configured, and makes one tiny real call. If anything is off it
 says exactly what to fix in one line - not a traceback.
 """
 
-import os
+from urllib.parse import urlparse
 
 from . import llm  # importing the package runs load_dotenv() in __init__
 
 
 def main() -> None:
-    key = os.environ.get("OPENAI_API_KEY")
-    base = os.environ.get("OPENAI_BASE_URL")
+    import os
 
-    if not key:
-        print("OPENAI_API_KEY is not set. Copy .env.example to .env and add your key (see Step 0 - Set up your environment and get an API key).")
+    try:
+        provider = llm.provider_kind()
+        if not llm.provider_ready():
+            print("Configure OPENAI_API_KEY or install and sign in to Kiro CLI.")
+            return
+        model = llm.default_model()
+    except ValueError:
+        print("Check LUCID_PROVIDER and the configured model ID.")
         return
 
-    print(f"key:   set ({key[:6]}...)")
-    print(f"base:  {base or 'api.openai.com (no OPENAI_BASE_URL set)'}")
-    print(f"model: {llm.default_model()}")
+    print(f"provider: {provider}")
+    if provider == "api":
+        print(f"base: {urlparse(os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com')).hostname}")
+        print("key: configured (hidden)")
+    print(f"model: {model}")
 
-    print("\nCalling the model...")
+    print("\nCalling the model (consumes provider credits/subscription usage)...")
     try:
         reply = llm.complete("You are a helpful assistant.", "Reply with exactly: ready", json_mode=False)
-    except Exception as err:  # noqa: BLE001 - we want a friendly one-liner, not a trace
-        msg = str(err)
-        if "model_not_found" in msg or "does not exist" in msg or "model not found" in msg.lower():
-            print("  model_not_found: the selected OPENAI_MODEL is not one your provider serves.")
-            print("  Set OPENAI_MODEL to an available model ID (keep OPENAI_BASE_URL for your gateway).")
-        else:
-            print(f"  call failed: {msg}")
+    except Exception:  # Raw SDK/CLI diagnostics may contain credentials or source.
+        print("  Call failed. Check provider authentication, model access, credits, and connectivity.")
         return
 
     print(f"reply: {reply.strip()!r}")
     if "ready" in reply.lower():
-        print("\nAll set - key, base URL, and model all resolve.")
+        print("\nAll set - provider authentication and model resolve.")
     else:
         print("\nGot a reply, so the chain resolves - the exact text just varied.")
 

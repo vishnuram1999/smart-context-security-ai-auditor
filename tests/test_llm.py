@@ -9,6 +9,77 @@ from lucid import context, llm
 
 
 class LLMTests(unittest.TestCase):
+    def setUp(self):
+        self.environment = patch.dict(os.environ, {"LUCID_PROVIDER": "api"})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_auto_provider_prefers_key_then_kiro_and_never_falls_back_on_failure(self):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": "fake"}), patch("lucid.llm.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.llm._client", side_effect=RuntimeError("provider failed")), patch("lucid.llm.kiro.complete") as fallback:
+            self.assertEqual(llm.provider_kind(), "api")
+            with self.assertRaises(RuntimeError):
+                llm.complete("system", "source")
+            fallback.assert_not_called()
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": "", "OPENAI_MODEL": "stale/requesty"}), patch("lucid.llm.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.llm.kiro.complete", return_value="answer") as complete, patch("lucid.llm.kiro.list_models", return_value=[{"id": "kiro-model"}]):
+            self.assertEqual(llm.provider_kind(), "kiro")
+            self.assertTrue(llm.provider_ready())
+            self.assertEqual(llm.default_model(), "kiro-default")
+            self.assertEqual(llm.list_models(), [{"id": "kiro-model"}])
+            self.assertEqual(llm.complete("system", "source", json_mode=False), "answer")
+            complete.assert_called_once_with("system", "source", model="kiro-default", json_mode=False, reasoning_effort=None)
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "auto", "OPENAI_API_KEY": ""}), patch("lucid.llm.kiro.executable", return_value=None):
+            self.assertFalse(llm.provider_ready())
+
+    def test_explicit_provider_overrides_and_invalid_configuration(self):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": "fake", "LUCID_KIRO_MODEL": "kiro-model"}):
+            self.assertEqual(llm.provider_kind(), "kiro")
+            self.assertEqual(llm.default_model(), "kiro-model")
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "unknown"}):
+            with self.assertRaises(ValueError):
+                llm.provider_kind()
+
+    def test_request_provider_override_does_not_mutate_environment(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fake", "OPENAI_MODEL": "api/model", "LUCID_KIRO_MODEL": "kiro/model"}), patch("lucid.llm.kiro.executable", return_value="/fake/kiro-cli"), patch("lucid.llm.kiro.complete", return_value="Kiro answer") as complete, patch("lucid.llm._client") as api:
+            before = dict(os.environ)
+            self.assertEqual(llm.provider_kind("kiro"), "kiro")
+            self.assertTrue(llm.provider_ready("kiro"))
+            self.assertEqual(llm.default_model("kiro"), "kiro/model")
+            self.assertEqual(llm.complete("system", "source", provider="kiro"), "Kiro answer")
+            complete.assert_called_once_with("system", "source", model="kiro/model", json_mode=True, reasoning_effort=None)
+            api.assert_not_called()
+            self.assertEqual(dict(os.environ), before)
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": ""}), patch("lucid.llm.kiro.complete") as fallback, patch("lucid.llm.OpenAI") as sdk:
+            self.assertEqual(llm.provider_kind("api"), "api")
+            self.assertFalse(llm.provider_ready("api"))
+            with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
+                llm.complete("system", "source", provider="api")
+            with self.assertRaisesRegex(RuntimeError, "OPENAI_API_KEY"):
+                llm.list_models(provider="api")
+            fallback.assert_not_called()
+            sdk.assert_not_called()
+
+    def test_request_auto_keeps_configured_default_and_rejects_invalid_values(self):
+        with patch.dict(os.environ, {"LUCID_PROVIDER": "kiro", "OPENAI_API_KEY": "fake"}):
+            self.assertEqual(llm.provider_kind("auto"), "kiro")
+        for provider in ("", "unknown", "API", " kiro "):
+            with self.subTest(provider=provider), self.assertRaises(ValueError):
+                llm.provider_kind(provider)
+
+    def test_selected_catalogs_never_invoke_inference(self):
+        client = self.client()
+        client.models.list.return_value = SimpleNamespace(data=[SimpleNamespace(id="api/model")])
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fake"}), patch("lucid.llm._client", return_value=client), patch("lucid.llm.kiro.list_models", return_value=[{"id": "kiro/model"}]) as catalog, patch("lucid.llm.kiro.complete") as complete:
+            self.assertEqual(llm.list_models(provider="kiro"), [{"id": "kiro/model"}])
+            self.assertEqual(llm.list_models(provider="api"), [{"id": "api/model"}])
+            catalog.assert_called_once_with()
+            complete.assert_not_called()
+            client.chat.completions.create.assert_not_called()
+
+    def test_context_only_forwards_provider_when_requested(self):
+        with patch("lucid.context.llm.complete", return_value="Context") as complete:
+            context.build_context("source", provider="kiro")
+            self.assertEqual(complete.call_args.kwargs, {"json_mode": False, "model": None, "reasoning_effort": None, "provider": "kiro"})
+
     def client(self):
         client = MagicMock()
         client.__enter__.return_value = client

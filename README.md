@@ -162,6 +162,60 @@ for every provider's native API. JSON/reasoning support, context limits, quality
 and cost vary. Source is shared with Requesty and its routed provider during
 paid scans; configure spending limits in Requesty if needed.
 
+### Kiro CLI without an API key
+
+Lucid automatically uses the OpenAI-compatible API when `OPENAI_API_KEY` is
+nonempty. If no key is configured and `kiro-cli` is on the backend's `PATH`, it
+uses **Kiro CLI via ACP** instead. It never switches providers after a failed
+request. An API key loaded from `.env` also takes precedence in automatic mode.
+
+On the machine running Lucid, install Kiro CLI and authenticate separately:
+
+```sh
+kiro-cli login
+kiro-cli acp --help
+python -m lucid.web
+```
+
+No Requesty/OpenAI key is needed for Kiro. In the dashboard's **Model provider**
+selector, choose **Automatic**, **API / Requesty**, or **Kiro CLI**. Choosing Kiro
+checks the selected backend configuration and automatically loads its catalog
+into **Available Kiro models**, without sending an audit prompt. **Load models**
+refreshes the list manually; API catalogs remain explicit-only. Changing providers
+clears the selected model and paid consent, cancels pending catalog requests, and
+leaves your source scope intact. Each audit pins its resolved provider and model.
+CLI detection alone does not verify login.
+The implementation targets CLI v2 ACP, including the 2.18.0 interface; live
+compatibility with your installation must be checked locally. V3 is not assumed
+compatible. A model catalog in `session/new` is required.
+
+Optional backend environment settings:
+
+- `LUCID_PROVIDER=auto` (default), `api`, or `kiro` to force a provider.
+- `LUCID_KIRO_CLI=/absolute/path/to/kiro-cli` if the executable isn't on `PATH`.
+- `LUCID_KIRO_MODEL=<Kiro model ID>` for a Kiro-specific default. Otherwise
+  `kiro-default` resolves to the session's current model before an audit starts;
+  the actual model ID is recorded and used by all subsequent rounds/lanes.
+  `OPENAI_MODEL` is deliberately not reused for Kiro.
+
+Kiro audits consume subscription credits and send the selected source to Kiro's
+service. Explicit consent remains required. Each context, lane, and judge prompt
+uses a fresh ACP session; six specialist lanes can open six processes in
+parallel and may encounter account concurrency limits. No automatic inference
+retries are made. JSON mode is a prompt instruction, not a structured-output
+API guarantee; findings still undergo strict schema validation. Reasoning effort
+overrides are unsupported and rejected before an audit prompt is sent.
+
+Lucid creates a restrictive temporary agent profile with no tools, resources,
+MCP servers, or hooks, denies ACP permission requests, and exposes no client
+filesystem/terminal methods. **This is not an OS sandbox.** The trusted Kiro
+executable retains access to its normal login/configuration, global settings may
+still apply, and Kiro can persist prompts in its session history. Do not use
+`--trust-all-tools`; review your Kiro configuration and use an external sandbox
+if OS-level isolation is required. The adapter currently requires macOS/Linux
+(or a suitable Linux environment such as WSL); its process transport uses POSIX
+pipes/process groups.
+
 ### GitHub targets
 
 Select **GitHub repository**, enter a repository root URL such as
