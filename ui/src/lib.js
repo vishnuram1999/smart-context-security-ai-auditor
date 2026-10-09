@@ -3,12 +3,15 @@ export const MODES = [
   { id: 'single', title: 'Single pass', label: '01', description: 'A focused vulnerability scan directly over your Solidity source.', detail: '1 model call' },
   { id: 'context', title: 'Context-aware', label: '02', description: 'Build a protocol understanding, then audit with that context.', detail: '2 model calls' },
   { id: 'loop', title: 'Iterative loop', label: '03', description: 'Build context once, then explore new findings across multiple rounds.', detail: 'Context + N rounds' },
+  { id: 'specialists', title: 'Specialist audit', label: '04', description: 'Five specialist lenses and one general lane, followed by an AI judge.', detail: 'Context + 6 parallel lanes + judge' },
 ];
 export const isActive = (job) => ['queued', 'running'].includes(job?.status);
-export const callCount = (mode, rounds) => mode === 'single' ? 1 : mode === 'context' ? 2 : rounds + 1;
+export const callCount = (mode, rounds) => mode === 'single' ? 1 : mode === 'context' ? 2 : mode === 'specialists' ? 2 + 6 * rounds : rounds + 1;
+export const requestRounds = (mode, rounds) => ['loop', 'specialists'].includes(mode) ? rounds : 1;
+
 export const charCount = (text) => { let count = 0; for (const _char of text) count++; return count; };
 export function parseRoute(hash) {
-  const match = /^#\/(audit|example)\/([^/]+)$/.exec(hash);
+  const match = /^#\/(audit)\/([^/]+)$/.exec(hash);
   if (!match) return { type: 'new', id: null };
   try { return { type: match[1], id: decodeURIComponent(match[2]) }; }
   catch { return { type: 'new', id: null }; }
@@ -96,7 +99,7 @@ export async function request(path, { signal, method = 'GET', body, timeoutMs = 
       : githubPreview ? 'Check the public repository root URL, ref, and subdirectory, and the backend’s GitHub connectivity, then preview again. No model calls were requested.'
       : response.status === 401 ? 'Configure the provider key on the backend, then refresh configuration.'
       : response.status === 413 ? 'Select fewer or smaller source files.'
-      : response.status === 404 ? 'Refresh history or examples; this item may no longer exist.'
+      : response.status === 404 ? 'Refresh audit history; this job may no longer exist.'
       : response.status >= 500 ? 'Check the backend logs and provider configuration, then retry.'
       : 'Review the source selection and audit settings, then retry.';
     throw new Error(`API ${response.status}${detail ? `: ${detail}` : ''}. ${action}`);

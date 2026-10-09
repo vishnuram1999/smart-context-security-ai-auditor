@@ -44,8 +44,8 @@ GENERAL_HUNTER_KEY = "general_hunter"
 
 # Default round count per lane - every lane (specialist or general) loops this
 # many times unless told otherwise. 10, not Module 2's 5: this is the setup
-# Module 3's published numbers were measured with (target/runs/m3-run-*.json,
-# `rounds_per_lane: 10`), so running with no arguments reproduces them.
+# Module 3's upstream published runs used (`rounds_per_lane: 10`).
+# Historical report files are not bundled in this fork.
 _DEFAULT_LANE_ROUNDS = 10
 
 

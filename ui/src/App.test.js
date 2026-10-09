@@ -14,6 +14,141 @@ const code = transformed.code.replace(/from "([^"]+)"|from '([^']+)'/g, (_match,
 });
 const { default: App } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 
+test('specialists forward all sources and settings, lock submission, and separate lane candidates from judged reports', async () => {
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
+  const originalFetch = globalThis.fetch;
+  const originals = new Map();
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, IS_REACT_ACT_ENVIRONMENT: true })) {
+    originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
+  }
+  const calls = [];
+  const pending = [];
+  const raw = { title: 'Raw duplicate', severity: 'high', location: 'Vault.sol:1', description: '<script>unsafe()</script>', impact: 'Unreviewed claim', exploit_steps: ['Raw evidence'], evidence: '<img src=x onerror=unsafe()>' };
+  const judged = { ...raw, title: 'Judged claim', description: 'AI reviewed claim' };
+  const snapshot = { id: 'pinned-preview', repository_url: 'https://github.com/owner/repo', repository: 'owner/repo', commit: 'a'.repeat(40), ref: 'main', subdirectory: '', file_count: 1, total_chars: 17, files: [{ path: 'Vault.sol', content: 'contract Vault {}' }] };
+  let job = {
+    id: 'specialist-job', mode: 'specialists', status: 'running', stage: 'specialist_lanes', rounds: 2, total_rounds: 12, completed_rounds: 5, judge_status: 'queued', findings: [],
+    lanes: ['queued', 'running', 'completed', 'failed', 'stopped', 'completed'].map((status, index) => ({ key: `lane-${index}`, name: `Lens ${index}`, status, completed_rounds: index === 0 ? 0 : 1, rounds: 2, findings_count: index === 0 ? 0 : 1, error: status === 'failed' ? 'Safe lane failure' : null })),
+    findings_by_lane: { 'lane-1': [raw], 'lane-2': [raw] },
+  };
+  globalThis.fetch = async (path, options) => {
+    calls.push({ path, options });
+    if (path === '/api/config') return Response.json({ model: 'default-model', provider: 'test-provider', key_configured: true, max_chars: 1000 });
+
+    if (path === '/api/github/preview') return Response.json(snapshot);
+    if (path === '/api/audits' && options.method === 'POST') return new Promise((resolve) => pending.push(resolve));
+    if (path === '/api/audits') return Response.json([job]);
+    if (path === '/api/audits/specialist-job') return Response.json(job);
+    throw new Error(`Unexpected request: ${path}`);
+  };
+  const root = createRoot(document.getElementById('root'));
+  const flush = async (fn = () => {}) => act(async () => { fn(); await new Promise((resolve) => setTimeout(resolve, 30)); });
+  const button = (text) => [...document.querySelectorAll('button')].find((element) => element.textContent.includes(text));
+  const consent = () => document.getElementById('paid-consent');
+  const edit = async (id, value) => flush(() => {
+    const input = document.getElementById(id);
+    const propsKey = Object.keys(input).find((key) => key.startsWith('__reactProps$'));
+    input[propsKey].onChange({ target: { value } });
+  });
+  const navigate = async (hash) => flush(() => { window.location.hash = hash; window.dispatchEvent(new dom.window.HashChangeEvent('hashchange')); });
+  const posts = () => calls.filter((call) => call.path === '/api/audits' && call.options.method === 'POST');
+  try {
+    await flush(() => root.render(React.createElement(App)));
+    assert.equal(document.querySelectorAll('.mode-card').length, 4);
+    assert.match(document.querySelector('.history-item').textContent, /Specialist audit/);
+    assert.ok(document.querySelector('.history-icon circle'), 'specialist history uses its own icon');
+    await flush(() => document.querySelector('input[value="loop"]').click());
+    assert.equal(document.getElementById('rounds').value, '3');
+    await edit('rounds', '10');
+    await flush(() => consent().click());
+    await flush(() => document.querySelector('input[value="specialists"]').click());
+    assert.equal(consent().checked, false);
+    assert.equal(document.getElementById('rounds').value, '1', 'specialists never inherit loop rounds');
+    assert.match(document.body.textContent, /Up to 8 paid model calls/);
+    assert.match(document.body.textContent, /Audit rounds per lane/);
+    assert.match(document.body.textContent, /6 parallel lanes × 1 rounds per lane.*up to 1 AI judge call.*skipped if there are no candidates/);
+    assert.match(document.body.textContent, /rate limits.*failures.*cost.*not human verification/);
+    for (const target of ['bundled', 'upload', 'github']) {
+      if (target !== 'bundled') {
+        await flush(() => consent().click());
+        await flush(() => document.querySelector(`input[value="${target}"]`).click());
+        assert.equal(consent().checked, false, 'source changes reset consent');
+        await flush(() => document.querySelector('input[value="specialists"]').click());
+        assert.equal(document.getElementById('rounds').value, '1');
+      }
+      if (target === 'upload') {
+        const input = document.querySelector('input[aria-label="Upload folder of Solidity files"]');
+        Object.defineProperty(input, 'files', { configurable: true, value: [{ name: 'Vault.sol', webkitRelativePath: 'contracts/Vault.sol', size: 17, text: async () => 'contract Vault {}' }, { name: 'ignore.txt', size: 1, text: async () => 'x' }] });
+        await flush(() => input.dispatchEvent(new dom.window.Event('change', { bubbles: true })));
+      }
+      if (target === 'github') {
+        await edit('github-url', snapshot.repository_url);
+        await flush(() => button('Preview repository').click());
+      }
+      for (const [id, value] of [['rounds', '2'], ['audit-model', ' provider/specialist '], ['json-mode', 'false'], ['reasoning-effort', 'high']]) {
+        await flush(() => consent().click());
+        await edit(id, value);
+        assert.equal(consent().checked, false, `${id} resets consent`);
+      }
+      assert.match(document.body.textContent, /Up to 14 paid model calls/);
+      await flush(() => consent().click());
+      await flush(() => button('Start live audit').click());
+      assert.deepEqual(JSON.parse(posts().at(-1).options.body), { mode: 'specialists', rounds: 2, model: 'provider/specialist', json_mode: false, reasoning_effort: 'high', confirmed_paid: true, target, files: target === 'upload' ? [{ path: 'contracts/Vault.sol', content: 'contract Vault {}' }] : [], ...(target === 'github' ? { github_preview_id: 'pinned-preview' } : {}) });
+      for (const input of document.querySelectorAll('form input, form select')) assert.ok(input.matches(':disabled'), `${input.id || input.name} is locked`);
+      assert.ok(button('New audit').disabled);
+      await flush(() => document.querySelector('form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })));
+      assert.equal(posts().length, ['bundled', 'upload', 'github'].indexOf(target) + 1, 'duplicate submits are locked');
+      await flush(() => pending.shift()(Response.json(job)));
+      await navigate('#/audit/specialist-job');
+      assert.match(document.body.textContent, /5 \/ 12 lane rounds/);
+      assert.equal(document.querySelector('progress[aria-label="Completed audit rounds"]').max, 12);
+      assert.equal(document.querySelectorAll('.lane-progress').length, 6);
+      assert.match(document.querySelector('.lane-progress').textContent, /Lens 0queued0 \/ 2 rounds · 0 raw candidates/);
+      for (const status of ['queued', 'running', 'completed', 'failed', 'stopped']) assert.ok(document.querySelector(`.lane-progress .status.${status}`));
+      assert.match(document.querySelector('.judge-stage').textContent, /AI judge stagequeued/);
+      assert.match(document.querySelector('.specialist-stages').textContent, /Safe lane failure/);
+      assert.match(document.getElementById('findings-heading').textContent, /AI-judged findings · Not verified/);
+      assert.equal(document.querySelectorAll('.findings-section .finding-card').length, 0);
+      assert.match(document.querySelector('.lane-candidates').textContent, /Unjudged.*duplicates/s);
+      assert.equal(document.querySelector('.candidate-lane').open, false);
+      assert.match(document.querySelector('.candidate-evidence pre').textContent, /<script>unsafe\(\)<\/script>/);
+      assert.equal(document.querySelectorAll('.lane-candidates script, .lane-candidates img').length, 0);
+      await flush(() => button('New audit').click());
+    }
+    job = { ...job, stage: 'judging', judge_status: 'running', completed_rounds: 12 };
+    await navigate('#/audit/specialist-job');
+    assert.match(document.querySelector('.judge-stage').textContent, /AI judge stagerunning/);
+    assert.match(document.querySelector('.progress-label').textContent, /judging12 \/ 12 lane rounds/);
+    await navigate('#/new');
+    job = { ...job, status: 'failed', judge_status: 'failed', error: 'Safe judge failure' };
+    await navigate('#/audit/specialist-job');
+    assert.match(document.querySelector('.report-overview').textContent, /Audit failed.*Raw lane candidates.*unjudged.*duplicates/s);
+    assert.match(document.querySelector('.specialist-stages').textContent, /Judge failed: raw candidates remain unjudged/);
+    assert.equal(document.querySelectorAll('.findings-section .finding-card').length, 0);
+    job = { ...job, status: 'completed', error: null, judge_status: 'completed', findings: [judged] };
+    await navigate('#/new');
+    await navigate('#/audit/specialist-job');
+    assert.equal(document.querySelectorAll('.findings-section .finding-card').length, 1);
+    assert.match(document.querySelector('.findings-section').textContent, /Judged claim/);
+    assert.doesNotMatch(document.querySelector('.findings-section').textContent, /Raw duplicate/);
+    job = { ...job, judge_status: 'skipped', findings: [], findings_by_lane: {} };
+    await navigate('#/new');
+    await navigate('#/audit/specialist-job');
+    assert.match(document.querySelector('.specialist-stages').textContent, /Judge skipped: no candidates/);
+    assert.equal(posts().length, 3);
+    assert.equal(calls.some((call) => call.path.startsWith('/api/examples')), false);
+  } finally {
+    await act(async () => root.unmount());
+    dom.window.close();
+    globalThis.fetch = originalFetch;
+    for (const [key, descriptor] of originals) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  }
+});
+
 test('GitHub previews are keyless, race-safe, reviewable, and require fresh consent for pinned audits', async () => {
   const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
   const originalFetch = globalThis.fetch;
@@ -32,7 +167,7 @@ test('GitHub previews are keyless, race-safe, reviewable, and require fresh cons
   globalThis.fetch = async (path, options) => {
     calls.push({ path, options });
     if (path === '/api/config') return Response.json({ model: 'test-model', provider: 'test-provider', key_configured: keyConfigured, max_chars: 1000 });
-    if (path === '/api/examples' || (path === '/api/audits' && options.method !== 'POST')) return Response.json([]);
+    if (path === '/api/audits' && options.method !== 'POST') return Response.json([]);
     if (path === '/api/github/preview') return new Promise((resolve, reject) => pending.push({ resolve, reject, options }));
     if (path === '/api/audits' || path === '/api/audits/github-job') return Response.json({ id: 'github-job', status: 'completed', target: 'github', mode: 'context', findings: [], source: snapshot() });
     throw new Error(`Unexpected request: ${path}`);
@@ -167,7 +302,7 @@ test('model settings load explicitly, preserve manual entry, gate consent, and i
     calls.push({ path, options });
     if (path === '/api/config') return Response.json({ model: defaultModel, provider: 'test-provider', key_configured: true });
     if (path === '/api/models') return new Promise((resolve, reject) => pending.push({ resolve, reject, options }));
-    if (path === '/api/examples' || (path === '/api/audits' && options.method === 'GET')) return Response.json([]);
+    if (path === '/api/audits' && options.method === 'GET') return Response.json([]);
     if (path === '/api/audits' && options.method === 'POST') return new Promise((resolve) => { resolveAudit = resolve; });
     if (path === '/api/audits/model-job') return Response.json({ id: 'model-job', status: 'completed', findings: [] });
     throw new Error(`Unexpected request: ${path}`);
@@ -280,8 +415,8 @@ test('model settings load explicitly, preserve manual entry, gate consent, and i
 });
 
 // A finite DOM integration test: no servers, provider calls, or browser binaries.
-test('rendered workflow gates paid scans, loads examples, uploads, submits, and preserves history after reset', async () => {
-  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/new' });
+test('rendered workflow gates paid scans, ignores legacy example routes, uploads, submits, and preserves history after reset', async () => {
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://localhost/#/example/old-link' });
   const originalFetch = globalThis.fetch;
   const originals = new Map();
   for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement, IS_REACT_ACT_ENVIRONMENT: true })) {
@@ -296,8 +431,7 @@ test('rendered workflow gates paid scans, loads examples, uploads, submits, and 
   globalThis.fetch = async (path, options) => {
     calls.push({ path, options });
     if (path === '/api/config') return Response.json({ model: 'test-model', provider: 'test-provider', key_configured: keyConfigured, default_target: 'target/src', default_file_count: 12, max_chars: 1000 });
-    if (path === '/api/examples') return Response.json([{ id: 'saved-1', title: 'Context sample', findings_count: 1 }]);
-    if (path === '/api/examples/saved-1') return Response.json({ _meta: { model: 'example-model' }, findings: [finding], context: 'Protocol actors and invariants' });
+
     if (path === '/api/audits' && options.method === 'POST') {
       job = { id: 'job-1', status: 'running', stage: 'finding_bugs', mode: 'loop', rounds: 3, completed_rounds: 1, findings: [finding], context: 'Live protocol context', error: null, warnings: ['Verify every finding'], created_at: '2026-10-04T10:00:00Z', model: 'test-model', target: 'upload' };
       return Response.json({ ...job, status: 'queued' });
@@ -317,10 +451,17 @@ test('rendered workflow gates paid scans, loads examples, uploads, submits, and 
     await flush(() => root.render(React.createElement(App)));
     assert.equal(button('Start live audit').disabled, true);
     assert.match(document.body.textContent, /Live audits are locked/);
+    assert.ok(document.querySelector('.audit-form'), 'legacy direct links show the new-audit form');
+    assert.deepEqual(calls.map((call) => call.path).sort(), ['/api/audits', '/api/config']);
+    assert.equal(document.querySelector('[aria-label="Saved examples"], .example-list, .example-item'), null);
+    assert.doesNotMatch(document.body.textContent, /Saved examples|Saved example|Saved output/);
+    const requestsBeforeLegacy = calls.length;
     await navigate('#/example/saved-1');
-    assert.match(document.body.textContent, /Saved example · Not a live scan/);
-    assert.match(document.body.textContent, /Unchecked callback/);
-    assert.match(document.body.textContent, /Protocol context/);
+    assert.ok(document.querySelector('.audit-form'), 'legacy hashes show the new-audit form');
+    assert.match(document.querySelector('.topbar').textContent, /New audit/);
+    assert.equal(document.querySelector('.results'), null);
+    assert.equal(calls.length, requestsBeforeLegacy, 'legacy navigation makes no API request');
+    assert.equal(calls.some((call) => call.path.startsWith('/api/examples')), false);
     assert.equal(calls.some((call) => call.options.method === 'POST'), false);
 
     keyConfigured = true;
@@ -365,6 +506,7 @@ test('rendered workflow gates paid scans, loads examples, uploads, submits, and 
     assert.equal(document.querySelector('[role="alert"]'), null);
     assert.ok(document.querySelector('.finding-card > summary'));
     assert.ok(document.querySelector('.context-panel > summary'));
+    assert.equal(calls.some((call) => call.path.startsWith('/api/examples')), false);
   } finally {
     await act(async () => root.unmount());
     dom.window.close();

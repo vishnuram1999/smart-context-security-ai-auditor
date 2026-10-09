@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { callCount, charCount, filterFindings, isActive, modelIds, parseRoute, request, routeHref, validateModel, validateFiles, validateGithubPreview, validateGithubUrl } from './lib.js';
+import { MODES, callCount, charCount, filterFindings, isActive, modelIds, parseRoute, request, requestRounds, routeHref, validateModel, validateFiles, validateGithubPreview, validateGithubUrl } from './lib.js';
 
 test('model validation accepts provider IDs without requiring list membership', () => {
   for (const id of ['gpt-model', 'provider/model:free', 'model.v1_2']) assert.equal(validateModel(id), null);
@@ -37,10 +37,23 @@ test('paid call counts include context only when used', () => {
   assert.equal(callCount('context', 10), 2);
   assert.equal(callCount('loop', 1), 2);
   assert.equal(callCount('loop', 10), 11);
+  assert.equal(callCount('specialists', 1), 8);
+  assert.equal(callCount('specialists', 10), 62);
 });
-test('history and examples have distinct, encoded routes', () => {
+test('specialist strategy requests per-lane rounds', () => {
+  assert.equal(MODES.length, 4);
+  assert.equal(MODES[3].id, 'specialists');
+  for (const rounds of [1, 3, 10]) {
+    for (const mode of ['loop', 'specialists']) assert.equal(requestRounds(mode, rounds), rounds);
+    for (const mode of ['single', 'context']) assert.equal(requestRounds(mode, rounds), 1);
+  }
+
+});
+test('audit routes encode IDs and unsupported or legacy routes fall back to new', () => {
   assert.deepEqual(parseRoute(routeHref('audit', 'job/a b')), { type: 'audit', id: 'job/a b' });
-  assert.deepEqual(parseRoute(routeHref('example', 'saved-1')), { type: 'example', id: 'saved-1' });
+  for (const hash of ['#/example/saved-1', '#/example/%E0%A4', '#/unknown/item']) {
+    assert.deepEqual(parseRoute(hash), { type: 'new', id: null });
+  }
   assert.deepEqual(parseRoute('#/new'), { type: 'new', id: null });
   assert.deepEqual(parseRoute('#/audit/%E0%A4'), { type: 'new', id: null });
 });

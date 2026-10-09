@@ -89,15 +89,39 @@ you can start it now with `.venv/bin/python -m lucid.web`.
 If Homebrew's Node 24 executable is not on your PATH, prefix npm commands with
 `PATH=/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/usr/bin:/bin`.
 
-- Browse the 15 saved examples without an API key or model calls.
+
 - Scan bundled SecondSwap, upload `.sol` files/a contract folder, or preview a
   public GitHub repository.
-- Choose a single pass, context-aware pass, or 1–10 exclusion rounds.
+- Choose a single pass, context-aware pass, 1–10 exclusion rounds, or a specialist audit.
 - Follow progress, filter findings, inspect evidence/context, and export JSON.
 - Live scans require explicit consent: source and context are sent to the
   configured remote AI provider and incur usage charges. API keys stay on the
   backend; configure `.env` as above, then restart the server. Select a model
   per audit in the UI, or leave the field blank to use `OPENAI_MODEL`.
+
+### Specialist audits in the dashboard
+
+Choose **Specialist audit** after selecting bundled, uploaded, or previewed
+GitHub source. One shared protocol-context pass feeds five focused specialist
+lanes (state/lifecycle, trust boundaries, arithmetic, temporal/staleness, and
+edge cases) plus the general auditor, running concurrently. Each lane excludes
+its own earlier findings; an AI judge reconciles their pooled candidates.
+Your selected model and reasoning setting apply to context, all lanes, and the
+judge; JSON mode applies to lane and judge responses.
+
+The UI defaults to **one round per lane** and permits 1–10. Maximum planned
+calls are `2 + 6 × rounds`: **8** at one round, **62** at ten. The judge is
+skipped when successful lanes return no candidates. Concurrent calls can hit
+provider rate limits; spending and context limits depend on your model.
+
+Reports show each lane's progress, candidate count, and judge status. Raw lane
+candidates remain separately labeled and exportable; only the judge's final
+findings appear in the main report. A lane failure, unreadable output, or judge
+failure marks the audit incomplete rather than implying a clean result. New
+calls stop best-effort after a lane failure or shutdown, but calls already in
+flight cannot be cancelled. There is still no user cancellation endpoint.
+An AI judge is not human verification, and an empty report is not proof of
+security. CLI specialist behavior remains unchanged.
 
 ### Requesty and model selection
 

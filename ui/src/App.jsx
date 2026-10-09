@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { MODES, SEVERITIES, callCount, charCount, filterFindings, isActive, modelIds, parseRoute, request, routeHref, validateModel, validateFiles, validateGithubPreview, validateGithubUrl } from './lib.js';
+import { MODES, SEVERITIES, callCount, charCount, filterFindings, isActive, modelIds, parseRoute, request, requestRounds, routeHref, validateModel, validateFiles, validateGithubPreview, validateGithubUrl } from './lib.js';
 
 function Icon({ name, size = 20, ...props }) {
   const paths = {
@@ -9,6 +9,7 @@ function Icon({ name, size = 20, ...props }) {
     file: <><path d="M14 2H5v20h14V7zM14 2v5h5M8 12h8M8 16h6" /></>,
     upload: <><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5" /></>,
     layers: <><path d="m12 3 10 5-10 5L2 8zM2 12l10 5 10-5M2 16l10 5 10-5" /></>,
+    specialists: <><circle cx="12" cy="12" r="3" /><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l3 3M16 16l3 3M5 19l3-3M16 8l3-3" /></>,
     loop: <><path d="M20 7a9 9 0 0 0-15-2L2 8m0-5v5h5M4 17a9 9 0 0 0 15 2l3-3m0 5v-5h-5" /></>,
     clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
     download: <><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4" /></>,
@@ -32,8 +33,7 @@ export default function App() {
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
   const [config, setConfig] = useState(null);
   const [configError, setConfigError] = useState('');
-  const [examples, setExamples] = useState([]);
-  const [examplesError, setExamplesError] = useState('');
+
   const [jobs, setJobs] = useState([]);
   const [historyError, setHistoryError] = useState('');
   const [refresh, setRefresh] = useState(0);
@@ -88,9 +88,7 @@ export default function App() {
     request('/api/config', { signal: controller.signal }).then((data) => { setConfig(data); setConfigError(''); }).catch((error) => {
       if (!controller.signal.aborted) { setConfig(null); setConfigError(error.message); }
     });
-    request('/api/examples', { signal: controller.signal }).then((data) => { setExamples(data); setExamplesError(''); }).catch((error) => {
-      if (!controller.signal.aborted) setExamplesError(error.message);
-    });
+
     return () => controller.abort();
   }, [refresh]);
   useEffect(() => {
@@ -114,13 +112,13 @@ export default function App() {
     if (route.type === 'new') { setResultLoading(false); return () => controller.abort(); }
     setResultLoading(true);
     async function load() {
-      let retry = route.type === 'audit';
+      let retry = true;
       try {
-        const data = await request(`/api/${route.type === 'audit' ? 'audits' : 'examples'}/${encodeURIComponent(route.id)}`, { signal: controller.signal });
+        const data = await request(`/api/audits/${encodeURIComponent(route.id)}`, { signal: controller.signal });
         if (controller.signal.aborted) return;
         setResult(data);
         setResultError('');
-        if (route.type === 'audit') { upsertJob(data); retry = isActive(data); }
+        upsertJob(data); retry = isActive(data);
       } catch (error) { if (!controller.signal.aborted) setResultError(error.message); }
       finally { if (!controller.signal.aborted) setResultLoading(false); }
       if (retry && !controller.signal.aborted) timer = setTimeout(load, 2500);
@@ -221,7 +219,7 @@ export default function App() {
     if (!canStart || submitLock.current) return;
     submitLock.current = true; setSubmitting(true); setSubmitError('');
     try {
-      const job = await request('/api/audits', { method: 'POST', body: { mode, rounds: mode === 'loop' ? rounds : 1, model: selectedModel, json_mode: jsonMode, reasoning_effort: reasoningEffort, confirmed_paid: true, target, files: target === 'upload' ? files : [], ...(target === 'github' ? { github_preview_id: preview.id } : {}) } });
+      const job = await request('/api/audits', { method: 'POST', body: { mode, rounds: requestRounds(mode, rounds), model: selectedModel, json_mode: jsonMode, reasoning_effort: reasoningEffort, confirmed_paid: true, target, files: target === 'upload' ? files : [], ...(target === 'github' ? { github_preview_id: preview.id } : {}) } });
       if (!job.id) throw new Error('The API did not return a job ID. Refresh history before submitting again.');
       upsertJob(job); setConfirmed(false); window.location.hash = routeHref('audit', job.id);
       retryAll();
@@ -241,23 +239,20 @@ export default function App() {
       {historyError && <Notice onRetry={retryAll}>{historyError}</Notice>}
       {!jobs.length && !historyError && <p className="sidebar-empty">Your live audits will appear here. Jobs keep running when you switch views.</p>}
       <nav className="history-list" aria-label="Audit history">{jobs.map((job) => <a key={job.id} href={routeHref('audit', job.id)} className={`history-item ${route.type === 'audit' && route.id === job.id ? 'selected' : ''}`} aria-current={route.type === 'audit' && route.id === job.id ? 'page' : undefined}>
-        <span className="history-icon"><Icon name={job.mode === 'loop' ? 'loop' : 'shield'} size={17} /></span><span className="history-copy"><strong>{MODES.find((item) => item.id === job.mode)?.title || 'Live audit'}</strong><small>{displayDate(job.created_at)}</small><Status status={job.status} /></span>
+        <span className="history-icon"><Icon name={job.mode === 'specialists' ? 'specialists' : job.mode === 'loop' ? 'loop' : 'shield'} size={17} /></span><span className="history-copy"><strong>{MODES.find((item) => item.id === job.mode)?.title || 'Live audit'}</strong><small>{displayDate(job.created_at)}</small><Status status={job.status} /></span>
       </a>)}</nav>
-      <div className="nav-section-title"><span>Saved examples</span><span className="tiny-label">NO API CALLS</span></div>
-      {examplesError && <Notice onRetry={retryAll}>{examplesError}</Notice>}
-      <nav className="example-list" aria-label="Saved examples">{examples.map((example) => <a key={example.id} href={routeHref('example', example.id)} className={`example-item ${route.type === 'example' && route.id === example.id ? 'selected' : ''}`} aria-current={route.type === 'example' && route.id === example.id ? 'page' : undefined}><Icon name="file" size={16} /><span>{example.title}<small>Saved output · {example.findings_count} findings</small></span></a>)}</nav>
-      {!examples.length && !examplesError && <p className="sidebar-empty">No saved examples available yet.</p>}
+
       <div className="sidebar-footer"><Icon name="shield" size={18} /><div>Keys stay on your backend<small>Live scans use your AI provider.</small></div></div>
     </aside>
     <div className="main-shell">
-      <header className="topbar"><div><span className="muted">Workspace</span><span className="breadcrumb-divider">/</span><span>{route.type === 'new' ? 'New audit' : route.type === 'example' ? 'Saved example' : 'Audit report'}</span></div><span className={`connection ${config ? 'online' : ''}`}><span className="status-dot" />{config ? 'Local API connected' : configError ? 'API unavailable' : 'Connecting to API'}</span></header>
+      <header className="topbar"><div><span className="muted">Workspace</span><span className="breadcrumb-divider">/</span><span>{route.type === 'new' ? 'New audit' : 'Audit report'}</span></div><span className={`connection ${config ? 'online' : ''}`}><span className="status-dot" />{config ? 'Local API connected' : configError ? 'API unavailable' : 'Connecting to API'}</span></header>
       <main id="main-content" tabIndex={-1}>
-        <div className="page-heading"><div><div className="eyebrow"><span />SMART CONTRACT INTELLIGENCE</div><h1 ref={pageTitle} tabIndex={-1}>{route.type === 'new' ? 'A clearer view of your contracts.' : route.type === 'example' ? 'Explore a saved audit.' : 'Your audit, in focus.'}</h1><p>{route.type === 'new' ? 'Understand the protocol. Surface vulnerabilities. Follow the evidence.' : 'Review structured findings, trace their impact, and plan your next step.'}</p></div><div className="heading-emblem"><Icon name="shield" size={46} /></div></div>
-        {configError && <Notice onRetry={retryAll}>{configError} Saved examples do not require a provider key.</Notice>}
+        <div className="page-heading"><div><div className="eyebrow"><span />SMART CONTRACT INTELLIGENCE</div><h1 ref={pageTitle} tabIndex={-1}>{route.type === 'new' ? 'A clearer view of your contracts.' : 'Your audit, in focus.'}</h1><p>{route.type === 'new' ? 'Understand the protocol. Surface vulnerabilities. Follow the evidence.' : 'Review structured findings, trace their impact, and plan your next step.'}</p></div><div className="heading-emblem"><Icon name="shield" size={46} /></div></div>
+        {configError && <Notice onRetry={retryAll}>{configError}</Notice>}
         {activeJobs.length > 0 && <div className="active-banner"><span className="status-dot pulse" /><span>{activeJobs.length} active audit{activeJobs.length > 1 ? 's' : ''}. Switching views does not cancel a scan.</span><a href={routeHref('audit', activeJobs[0].id)}>View active audit <span aria-hidden="true">↗</span></a></div>}
         {route.type === 'new' ? <>
           <div className="config-strip"><div><span className="meta-label">MODEL</span><strong>{selectedModel || (config ? 'No model selected' : 'Waiting for backend')}</strong></div><div><span className="meta-label">PROVIDER</span><strong>{config?.provider || '—'}</strong></div><div><span className="meta-label">BACKEND KEY</span><strong className={config?.key_configured ? 'accent' : 'amber'}>{config ? config.key_configured ? 'Configured' : 'Not configured' : 'Unknown'}</strong></div></div>
-          {config && !config.key_configured && <Notice tone="warning" onRetry={retryAll}>Live audits are locked. Configure the provider key in the backend environment, then refresh. You can still preview public GitHub repositories and browse saved examples—no key or paid model calls needed.</Notice>}
+          {config && !config.key_configured && <Notice tone="warning" onRetry={retryAll}>Live audits are locked. Configure the provider key in the backend environment, then refresh. You can still preview public GitHub repositories—no key or paid model calls needed.</Notice>}
           <form onSubmit={startAudit} className="audit-form">
             <section className="panel source-panel"><div className="section-heading"><span className="step-number">01</span><div><h2>Select your source</h2><p>Choose the contracts you want to investigate.</p></div><span className="section-tag">SOLIDITY</span></div>
               <fieldset disabled={submitting}><legend className="sr-only">Source selection</legend><div className="segmented-control">{[['bundled', 'Bundled target', 'layers'], ['upload', 'Upload contracts', 'upload'], ['github', 'GitHub repository', 'layers']].map(([value, title, icon]) => <label key={value} className={target === value ? 'active' : ''}><input type="radio" name="target" value={value} checked={target === value} onChange={() => changeSetting(() => { clearPreview(); setTarget(value); })} /><Icon name={icon} size={17} />{title}</label>)}</div></fieldset>
@@ -274,8 +269,8 @@ export default function App() {
                               {preview && <GithubPreview preview={preview} />}
                             </div> : <div className="upload-source">
                 <Icon name="upload" size={29} /><h3>Bring your Solidity source</h3><p>Select multiple .sol files, or a folder to preserve relative paths.</p><div className="upload-actions"><button type="button" className="secondary-button" disabled={reading || submitting} onClick={() => fileInput.current?.click()}>Choose .sol files</button><button type="button" className="text-button" disabled={reading || submitting} onClick={() => folderInput.current?.click()}>Choose folder</button></div>
-                <input ref={fileInput} type="file" multiple accept=".sol" className="sr-only" tabIndex={-1} aria-label="Upload Solidity files" onChange={(event) => { readSources(event.target.files); event.target.value = ''; }} />
-                <input ref={folderInput} type="file" multiple webkitdirectory="" className="sr-only" tabIndex={-1} aria-label="Upload folder of Solidity files" onChange={(event) => { readSources(event.target.files, true); event.target.value = ''; }} />
+                <input ref={fileInput} type="file" disabled={reading || submitting} multiple accept=".sol" className="sr-only" tabIndex={-1} aria-label="Upload Solidity files" onChange={(event) => { readSources(event.target.files); event.target.value = ''; }} />
+                <input ref={folderInput} type="file" disabled={reading || submitting} multiple webkitdirectory="" className="sr-only" tabIndex={-1} aria-label="Upload folder of Solidity files" onChange={(event) => { readSources(event.target.files, true); event.target.value = ''; }} />
                 <span className="upload-limit">{config?.max_chars ? `${config.max_chars.toLocaleString()} character limit` : 'Backend source limit applies'} · Only .sol files are included</span>
               </div>}
               {reading && <p role="status" className="muted">Reading local source files…</p>}
@@ -284,8 +279,9 @@ export default function App() {
               {target === 'upload' && files.length > 0 && validationError && <Notice>{validationError}</Notice>}
             </section>
             <section className="panel"><div className="section-heading"><span className="step-number">02</span><div><h2>Choose an audit strategy</h2><p>Go from a focused pass to a deeper, iterative investigation.</p></div></div>
-              <fieldset disabled={submitting}><legend className="sr-only">Audit mode</legend><div className="mode-grid">{MODES.map((item) => <label key={item.id} className={`mode-card ${mode === item.id ? 'active' : ''}`}><input type="radio" name="mode" value={item.id} checked={mode === item.id} onChange={() => changeSetting(() => setMode(item.id))} /><div className="mode-card-top"><Icon name={item.id === 'single' ? 'shield' : item.id === 'context' ? 'layers' : 'loop'} size={23} /><span className="radio-indicator" /></div><h3>{item.title}</h3><p>{item.description}</p><span className="mode-detail">{item.detail}</span>{item.id === 'context' && <span className="recommended">RECOMMENDED</span>}</label>)}</div>
-              {mode === 'loop' && <div className="rounds-control"><label htmlFor="rounds">Audit rounds <small>One context call, followed by {rounds} finding rounds.</small></label><input id="rounds" type="range" min="1" max="10" step="1" value={rounds} onChange={(event) => changeSetting(() => setRounds(Number(event.target.value)))} /><output htmlFor="rounds">{rounds}</output></div>}</fieldset>
+              <fieldset disabled={submitting}><legend className="sr-only">Audit mode</legend><div className="mode-grid">{MODES.map((item) => <label key={item.id} className={`mode-card ${mode === item.id ? 'active' : ''}`}><input type="radio" name="mode" value={item.id} checked={mode === item.id} onChange={() => changeSetting(() => { setMode(item.id); if (item.id === 'specialists') setRounds(1); })} /><div className="mode-card-top"><Icon name={item.id === 'single' ? 'shield' : item.id === 'context' ? 'layers' : item.id === 'specialists' ? 'specialists' : 'loop'} size={23} /><span className="radio-indicator" /></div><h3>{item.title}</h3><p>{item.description}</p><span className="mode-detail">{item.detail}</span>{item.id === 'context' && <span className="recommended">RECOMMENDED</span>}</label>)}</div>
+              {['loop', 'specialists'].includes(mode) && <div className="rounds-control"><label htmlFor="rounds">{mode === 'specialists' ? 'Audit rounds per lane' : 'Audit rounds'} <small>{mode === 'specialists' ? `${rounds} rounds in each of 6 parallel lanes (${6 * rounds} lane rounds total).` : `One context call, followed by ${rounds} finding rounds.`}</small></label><input id="rounds" type="range" min="1" max="10" step="1" value={rounds} onChange={(event) => changeSetting(() => setRounds(Number(event.target.value)))} /><output htmlFor="rounds">{rounds}</output></div>}</fieldset>
+              {mode === 'specialists' && <p className="model-help">Six lanes run concurrently: provider rate limits may cause failures, and more rounds increase cost. The model judge is not human verification.</p>}
             </section>
             <section className="panel model-panel"><div className="section-heading"><span className="step-number">03</span><div><h2>Choose a model</h2><p>Use the backend default or enter a model ID for this audit.</p></div></div>
               <fieldset disabled={submitting}><legend className="sr-only">Model settings</legend>
@@ -293,14 +289,14 @@ export default function App() {
                 <datalist id="available-models">{models.map((id) => <option key={id} value={id} />)}</datalist>
                 <div className="model-options"><label htmlFor="json-mode">JSON mode<select id="json-mode" value={String(jsonMode)} onChange={(event) => changeSetting(() => setJsonMode(event.target.value === 'true'))}><option value="true">Enabled (default)</option><option value="false">Disabled</option></select></label><label htmlFor="reasoning-effort">Reasoning effort<select id="reasoning-effort" value={reasoningEffort || ''} onChange={(event) => changeSetting(() => setReasoningEffort(event.target.value || null))}><option value="">Provider default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label></div>
               </fieldset>
-              <p id="model-help" className="model-help">Model lists are fetched only when you click Load models; the backend may contact your provider. Manual IDs work without loading the list. All context and finding rounds use the same selected model. JSON mode is optional; finding responses are still parsed and validated regardless.</p>
+              <p id="model-help" className="model-help">Model lists are fetched only when you click Load models; the backend may contact your provider. Manual IDs work without loading the list. All context, finding rounds, and any specialist judge use the same selected model. JSON mode is optional; finding responses are still parsed and validated regardless.</p>
               <p className="model-help">Capabilities, JSON/reasoning support, pricing, and context limits vary by model and provider. No automatic paid compatibility retries are requested by this UI.</p>
               {modelsLoading && <p role="status" className="model-help">Loading provider model IDs… You can still enter a model manually.</p>}
               {!modelsLoading && models.length > 0 && <p role="status" className="model-help">{models.length} model IDs available. Type to search suggestions.</p>}
               {modelsError && <Notice>{modelsError}</Notice>}
               {modelError && <Notice>{modelError}</Notice>}
             </section>
-            <section className="panel launch-panel"><div className="section-heading"><span className="step-number">04</span><div><h2>Review & launch</h2><p>You’re always in control of paid model calls.</p></div></div><div className="cost-notice"><Icon name="clock" size={22} /><div><strong>{calls} paid model call{calls === 1 ? '' : 's'} planned</strong><p>{mode === 'single' ? 'One vulnerability scan.' : mode === 'context' ? 'One protocol-context call + one vulnerability scan.' : `One protocol-context call + ${rounds} vulnerability scans.`} Provider usage charges apply; retries may add calls. This is not a price estimate.</p></div></div>
+            <section className="panel launch-panel"><div className="section-heading"><span className="step-number">04</span><div><h2>Review & launch</h2><p>You’re always in control of paid model calls.</p></div></div><div className="cost-notice"><Icon name="clock" size={22} /><div><strong>{mode === 'specialists' ? `Up to ${calls} paid model calls` : `${calls} paid model call${calls === 1 ? '' : 's'} planned`}</strong><p>{mode === 'single' ? 'One vulnerability scan.' : mode === 'context' ? 'One protocol-context call + one vulnerability scan.' : mode === 'specialists' ? `One protocol-context call + 6 parallel lanes × ${rounds} rounds per lane + up to 1 AI judge call (skipped if there are no candidates).` : `One protocol-context call + ${rounds} vulnerability scans.`} Provider usage charges apply; retries may add calls. This is not a price estimate.</p></div></div>
               <label className="confirmation"><input type="checkbox" checked={confirmed} id="paid-consent" disabled={submitting || !config?.key_configured || !!modelError || (target === 'github' && (!preview || previewLoading || !!validationError))} onChange={(event) => setConfirmed(event.target.checked)} /><span>I authorize this live audit and its paid API usage.<small>Selected source and generated context will be sent by the backend to {config?.provider || 'the configured AI provider'} using model {selectedModel || '—'}. Credentials stay on the backend.</small></span></label>
               {submitError && <Notice>{submitError}</Notice>}
               <div className="launch-footer"><span><Icon name="shield" size={16} />AI findings require human verification.</span><button type="submit" className="primary-button" disabled={!canStart}>{submitting ? 'Starting audit…' : 'Start live audit'}<Icon name="arrow" size={18} /></button></div>
@@ -308,9 +304,9 @@ export default function App() {
             </section>
           </form>
         </> : <>
-          {resultLoading && <div className="panel loading-state" role="status"><span className="loader" />Loading {route.type === 'example' ? 'saved example' : 'audit report'}…</div>}
+          {resultLoading && <div className="panel loading-state" role="status"><span className="loader" />Loading audit report…</div>}
           {resultError && <Notice onRetry={() => setResultRetry((value) => value + 1)}>{resultError}{result && ' Showing the last successfully received data.'}</Notice>}
-          {result && <AuditResults key={`${route.type}:${route.id}`} data={result} example={route.type === 'example'} exampleTitle={examples.find((item) => item.id === route.id)?.title} id={route.id} onNew={reset} submitting={submitting} />}
+          {result && <AuditResults key={`${route.type}:${route.id}`} data={result} id={route.id} onNew={reset} submitting={submitting} />}
         </>}
         <footer className="main-footer"><span>lucid <span className="muted">/ AI-assisted security, with evidence.</span></span><span>Local interface · Remote model calls for live audits</span></footer>
       </main>
@@ -337,44 +333,80 @@ function GithubPreview({ preview }) {
   </div>;
 }
 
-function AuditResults({ data, example, exampleTitle, id, onNew, submitting }) {
+function SpecialistStages({ data }) {
+  const lanes = Array.isArray(data.lanes) ? data.lanes : [];
+  return <section className="panel specialist-stages" aria-labelledby="specialist-stages-heading">
+    <h2 id="specialist-stages-heading">Specialist lanes & AI judge</h2>
+    {lanes.length > 0 ? <div className="lane-grid">{lanes.map((lane) => <div className="lane-progress" key={lane.key}>
+      <div className="lane-heading"><h3>{lane.name || lane.key}</h3><Status status={lane.status} /></div>
+      <p>{lane.completed_rounds} / {lane.rounds} rounds · {lane.findings_count} raw candidates</p>
+      <progress aria-label={`${lane.name || lane.key} completed rounds`} max={Math.max(1, lane.rounds)} value={lane.completed_rounds} />
+      {lane.error && <Notice>{lane.error}</Notice>}
+    </div>)}</div> : <p className="model-help">Lane progress has not been returned yet.</p>}
+    <div className="judge-stage"><h3>AI judge stage</h3>{data.judge_status ? <Status status={data.judge_status} /> : <span className="muted">Status not recorded</span>}</div>
+    <p className="model-help">{data.judge_status === 'skipped' ? data.status === 'failed' ? 'Judge skipped: the audit was incomplete; any raw candidates remain unjudged. ' : 'Judge skipped: no candidates to review. ' : data.judge_status === 'failed' ? 'Judge failed: raw candidates remain unjudged. ' : ''}The model judge is not human verification.</p>
+  </section>;
+}
+
+function LaneCandidates({ data }) {
+  const candidatesByLane = data.findings_by_lane && typeof data.findings_by_lane === 'object' ? data.findings_by_lane : {};
+  const lanes = Array.isArray(data.lanes) ? data.lanes : [];
+  const keys = [...new Set([...lanes.map((lane) => lane.key), ...Object.keys(candidatesByLane)])];
+  return <section className="panel lane-candidates" aria-labelledby="lane-candidates-heading">
+    <h2 id="lane-candidates-heading">Raw lane candidates · Unjudged</h2>
+    <p className="model-help">Original model claims, not the AI-judged report and not verified vulnerabilities. Candidates may overlap or contain duplicates across lanes and rounds, or be rejected by the judge. On failure, they remain unjudged; do not treat them as accepted findings.</p>
+    {!keys.length && <p className="model-help">No lane candidates were included in this output.</p>}
+    {keys.map((key) => {
+      const candidates = Array.isArray(candidatesByLane[key]) ? candidatesByLane[key] : [];
+      const name = lanes.find((lane) => lane.key === key)?.name || key;
+      return <details className="candidate-lane" key={key}><summary><strong>{name}</strong><span>{candidates.length} raw candidates · Unjudged</span><span className="accordion-chevron" aria-hidden="true">⌄</span></summary>
+        {candidates.length ? candidates.map((candidate, index) => <div className="candidate-evidence" key={index}><h3>Candidate {index + 1}{candidate?.title ? ` · ${candidate.title}` : ''}</h3><pre aria-label={`${name} candidate ${index + 1} plain text evidence`}>{JSON.stringify(candidate, null, 2)}</pre></div>) : <p className="model-help">No candidates returned for this lane.</p>}
+      </details>;
+    })}
+  </section>;
+}
+
+function AuditResults({ data, id, onNew, submitting }) {
   const [severity, setSeverity] = useState('all');
   const [query, setQuery] = useState('');
   const [exportError, setExportError] = useState('');
+  const specialists = data.mode === 'specialists';
   const findings = Array.isArray(data.findings) ? data.findings : [];
   const visible = filterFindings(findings, severity, query);
-  const active = !example && isActive(data);
-  const totalRounds = Math.max(1, data.rounds || 1);
+  const active = isActive(data);
+  const totalRounds = Math.max(1, specialists ? data.total_rounds || 6 * (data.rounds || 1) : data.rounds || 1);
   const completedRounds = Math.min(totalRounds, Math.max(0, data.completed_rounds || 0));
-  const finished = example || data.status === 'completed';
+  const finished = data.status === 'completed';
   function exportJson() {
     try {
       const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
       const anchor = document.createElement('a');
-      anchor.href = url; anchor.download = `lucid-${example ? 'example' : 'audit'}-${id.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`;
+      anchor.href = url; anchor.download = `lucid-audit-${id.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`;
       document.body.appendChild(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
       setExportError('');
     } catch { setExportError('Could not export the report. Check browser download permissions and try again.'); }
   }
   return <div className="results">
-    {example && <Notice tone="example"><strong>Saved example · Not a live scan.</strong> This is previously saved output. Viewing it does not invoke the AI provider or incur model charges.</Notice>}
-    <section className="panel report-overview"><div className="report-heading"><div><div className="eyebrow">{example ? 'SAVED OUTPUT' : 'LIVE AUDIT'}</div><h2>{example ? exampleTitle || 'Saved audit example' : MODES.find((item) => item.id === data.mode)?.title || 'Audit report'}</h2><code className="report-id">{id}</code></div><div className="report-actions">{!example && <Status status={data.status} />}<button className="secondary-button" onClick={exportJson}><Icon name="download" size={16} />Export JSON</button><button className="text-button" onClick={onNew} disabled={submitting}>New audit</button></div></div>
-      <dl className="report-meta"><div><dt>Model</dt><dd>{data.model || data._meta?.model || 'Not recorded'}</dd></div><div><dt>Target</dt><dd>{data.target || data._meta?.target || 'Not recorded'}</dd></div><div><dt>{example ? 'Origin' : 'Started'}</dt><dd>{example ? 'Saved backend example' : displayDate(data.created_at)}</dd></div></dl>
+
+    <section className="panel report-overview"><div className="report-heading"><div><div className="eyebrow">LIVE AUDIT</div><h2>{MODES.find((item) => item.id === data.mode)?.title || 'Audit report'}</h2><code className="report-id">{id}</code></div><div className="report-actions"><Status status={data.status} /><button className="secondary-button" onClick={exportJson}><Icon name="download" size={16} />Export JSON</button><button className="text-button" onClick={onNew} disabled={submitting}>New audit</button></div></div>
+      <dl className="report-meta"><div><dt>Model</dt><dd>{data.model || 'Not recorded'}</dd></div><div><dt>Target</dt><dd>{data.target || 'Not recorded'}</dd></div><div><dt>Started</dt><dd>{displayDate(data.created_at)}</dd></div></dl>
       {data.source && <RepositoryMetadata source={data.source} />}
-      {active && <div className="progress-block"><div className="progress-label" role="status"><span><span className="status-dot pulse" />{data.stage ? data.stage.replaceAll('_', ' ') : data.status === 'queued' ? 'Waiting in the queue' : 'Audit in progress'}</span><strong>{completedRounds} / {totalRounds} rounds</strong></div><progress aria-label="Completed audit rounds" max={totalRounds} value={completedRounds} /><p>Refreshes automatically every 2.5 seconds. You can leave this view and return through audit history. There is no cancel endpoint.</p></div>}
-      {data.status === 'failed' && <Notice>Audit failed: {data.error || 'No error details returned.'} Check backend logs, the provider configuration, and source limits. Review any partial findings below before authorizing a new scan.</Notice>}
+      {active && <div className="progress-block"><div className="progress-label" role="status"><span><span className="status-dot pulse" />{data.stage ? data.stage.replaceAll('_', ' ') : data.status === 'queued' ? 'Waiting in the queue' : 'Audit in progress'}</span><strong>{completedRounds} / {totalRounds} {specialists ? 'lane rounds' : 'rounds'}</strong></div><progress aria-label="Completed audit rounds" max={totalRounds} value={completedRounds} /><p>Refreshes automatically every 2.5 seconds. You can leave this view and return through audit history. There is no cancel endpoint.</p></div>}
+      {data.status === 'failed' && <Notice>Audit failed: {data.error || 'No error details returned.'} Check backend logs, the provider configuration, and source limits. {specialists ? 'Raw lane candidates below are unjudged and may contain duplicates; they are not the judged report.' : 'Review any partial findings below before authorizing a new scan.'}</Notice>}
       {data.error && data.status !== 'failed' && <Notice>{data.error}</Notice>}
       {data.warnings?.length > 0 && <div className="notice warning"><div><strong>Backend warnings</strong><ul>{data.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></div></div>}
       {exportError && <Notice>{exportError}</Notice>}
-      {example && data._meta?.note && <p className="saved-note">{data._meta.note}</p>}
+
     </section>
-    <div className="severity-summary"><div className="summary-total"><span>{findings.length}</span><div>Findings<small>{active ? 'Partial results · audit running' : finished ? 'Ready for review' : 'Partial audit output'}</small></div></div>{SEVERITIES.map((level) => <button type="button" key={level} className={`summary-severity ${level} ${severity === level ? 'selected' : ''}`} aria-pressed={severity === level} onClick={() => setSeverity(severity === level ? 'all' : level)}><span>{findings.filter((finding) => finding.severity === level).length}</span><small><span className="severity-dot" />{level}</small></button>)}</div>
+    {specialists && <SpecialistStages data={data} />}
+    <div className="severity-summary"><div className="summary-total"><span>{findings.length}</span><div>{specialists ? 'AI-judged findings' : 'Findings'}<small>{active ? 'Partial results · audit running' : finished ? 'Ready for review' : 'Partial audit output'}</small></div></div>{SEVERITIES.map((level) => <button type="button" key={level} className={`summary-severity ${level} ${severity === level ? 'selected' : ''}`} aria-pressed={severity === level} onClick={() => setSeverity(severity === level ? 'all' : level)}><span>{findings.filter((finding) => finding.severity === level).length}</span><small><span className="severity-dot" />{level}</small></button>)}</div>
     {data.context ? <details className="panel context-panel"><summary><span className="context-icon"><Icon name="layers" /></span><span><strong>Protocol context</strong><small>Actors, invariants, and dependencies used to inform this audit.</small></span><span className="accordion-chevron" aria-hidden="true">⌄</span></summary><pre className="context-content">{data.context}</pre></details> : <div className="context-unavailable"><Icon name="layers" size={16} />{active ? 'Protocol context will appear here when available.' : 'No protocol context was included in this report.'}</div>}
-    <section className="findings-section" aria-labelledby="findings-heading"><div className="findings-heading"><div><h2 id="findings-heading">Security findings <span className="count-pill">{findings.length}</span></h2><p>{active ? 'Findings may change until the audit is completed.' : 'Model-generated claims, not verified vulnerabilities.'}</p></div><span className="tiny-label">EVIDENCE FIRST</span></div>
+    <section className="findings-section" aria-labelledby="findings-heading"><div className="findings-heading"><div><h2 id="findings-heading">{specialists ? 'AI-judged findings · Not verified' : 'Security findings'} <span className="count-pill">{findings.length}</span></h2><p>{specialists ? 'Only the AI judge’s report appears here, not raw lane candidates. The model judge is not human verification.' : active ? 'Findings may change until the audit is completed.' : 'Model-generated claims, not verified vulnerabilities.'}</p></div><span className="tiny-label">EVIDENCE FIRST</span></div>
       <div className="filter-bar"><label className="search-field"><Icon name="search" size={18} /><span className="sr-only">Search findings including exploit steps</span><input type="search" placeholder="Search title, location, or evidence…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label className="severity-select"><span className="sr-only">Filter by severity</span><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{SEVERITIES.map((level) => <option key={level} value={level}>{level[0].toUpperCase() + level.slice(1)}</option>)}</select></label></div>
       <p className="filter-count" role="status">Showing {visible.length} of {findings.length} findings{(query || severity !== 'all') && <button className="text-button" onClick={() => { setQuery(''); setSeverity('all'); }}>Clear filters</button>}</p>
-      {!visible.length && <div className="panel empty-findings"><Icon name={active ? 'clock' : 'shield'} size={34} /><h3>{findings.length ? 'No matching findings' : active ? 'Investigation in progress' : 'No findings returned'}</h3><p>{findings.length ? 'Try a different search or clear the severity filter.' : active ? 'Structured findings will appear as the backend returns them.' : 'An empty report is not proof of security. Review the source and audit warnings independently.'}</p></div>}
+      {!visible.length && <div className="panel empty-findings"><Icon name={active ? 'clock' : 'shield'} size={34} /><h3>{findings.length ? 'No matching findings' : specialists ? 'No AI-judged findings returned' : active ? 'Investigation in progress' : 'No findings returned'}</h3><p>{findings.length ? 'Try a different search or clear the severity filter.' : specialists ? 'Raw candidates are separate below and may be unjudged or duplicated, especially if a lane or the judge failed. An empty judged report is not proof of security.' : active ? 'Structured findings will appear as the backend returns them.' : 'An empty report is not proof of security. Review the source and audit warnings independently.'}</p></div>}
       <div className="finding-list">{visible.map((finding, index) => <details key={`${finding.title}:${finding.location}:${index}`} className="finding-card"><summary><span className={`severity-badge ${finding.severity}`}>{finding.severity}</span><span className="finding-title"><strong>{finding.title}</strong><code>{finding.location}</code></span><span className="accordion-chevron" aria-hidden="true">⌄</span></summary><div className="finding-body"><section><h3>Description</h3><p>{finding.description}</p></section><section><h3>Impact</h3><p>{finding.impact}</p></section><section><h3>Exploit steps</h3><ol>{(finding.exploit_steps || []).map((step, stepIndex) => <li key={stepIndex}>{step}</li>)}</ol></section></div></details>)}</div>
     </section>
+    {specialists && <LaneCandidates data={data} />}
   </div>;
 }

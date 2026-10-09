@@ -270,7 +270,7 @@ Want to build `lucid` yourself instead of cloning it? Copy the plumbing as-is fr
 
 We ran the finished harness against SecondSwap four separate times and scored every single one.
 
-> **How these runs were produced.** Four representative, unedited passes, saved in [`target/runs/run-1.json`](../target/runs/run-1.json) through [`run-4.json`](../target/runs/run-4.json) so you can check the table against the exact findings scored. Runs vary at temperature 0.3, so yours won't match these line for line.
+> **How these runs were produced.** Four representative, unedited passes, published upstream in [`run-1.json`](https://github.com/asendz/ai-web3-security-course/blob/master/target/runs/run-1.json) through [`run-4.json`](https://github.com/asendz/ai-web3-security-course/blob/master/target/runs/run-4.json) (not bundled in this fork) so you can check the table against the exact findings scored. Runs vary at temperature 0.3, so yours won't match these line for line.
 
 > **How matches are scored.** For each ground-truth bug, ask: does any of our findings name the same root-cause defect - the same specific thing wrong in the code, not just the same file or function - and would our fix actually eliminate it? Same root cause + same fix = **EXACT**. Same root cause but a narrower, different, or missing fix (or a severity gap of two levels or more) = **PARTIAL**. Different root cause entirely = **MISS**, even if it's one function away. Same bar real audit tooling gets graded on - not one invented for this article. (✅ EXACT · ◐ PARTIAL · – MISS. Try it yourself in the callout at the end of this section.)
 

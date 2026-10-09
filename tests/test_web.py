@@ -43,20 +43,13 @@ class WebTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Mock audit did not finish")
 
-    def test_config_and_examples(self):
+    def test_config_and_removed_example_routes(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://user:secret@example.com/v1"}):
             config = self.client.get("/api/config").json()
         self.assertEqual(config["provider"], "example.com")
         self.assertNotIn("secret", json.dumps(config))
-        examples = self.client.get("/api/examples").json()
-        self.assertEqual(len(examples), 15)
-        for example in examples:
-            report = self.client.get(f"/api/examples/{example['id']}").json()
-            self.assertEqual(example["findings_count"], len(report["findings"]))
-            if example["id"].startswith("m3-"):
-                self.assertEqual(report["findings"], report["judged_findings"])
-                self.assertIn("findings_by_lane", report)
-        self.assertEqual(self.client.get("/api/examples/not-found").status_code, 404)
+        self.assertEqual(self.client.get("/api/examples").status_code, 404)
+        self.assertEqual(self.client.get("/api/examples/run-1").status_code, 404)
 
     def test_request_guards(self):
         body = {"confirmed_paid": True}

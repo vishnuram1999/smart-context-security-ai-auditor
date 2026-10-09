@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import agent, context, llm
+from . import agent, context, judge, llm, specialists
 from .codebase import MAX_CHARS, load_codebase
 from .github import GitHubSourceError, fetch_repository
 from .schema import Finding
@@ -25,8 +25,13 @@ from .schema import Finding
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = ROOT / "target" / "src"
 DIST = ROOT / "ui" / "dist"
-EXAMPLES = ROOT / "target" / "runs"
+
 MAX_REQUEST_BYTES = 2_000_000
+PROVIDER_ERROR = "Provider request failed. Check your backend API key, base URL, model, credits, and network. Earlier rounds remain available; retries may incur additional charges."
+SPECIALIST_LANES = [
+    {"key": lane["key"], "name": lane["name"]} for lane in specialists.SPECIALISTS
+] + [{"key": "general_hunter", "name": "General Hunter (broad, unfocused pass)"}]
+
 ALLOWED_ORIGINS = {
     f"http://{host}:{port}"
     for host in ("localhost", "127.0.0.1")
@@ -40,7 +45,7 @@ class SourceFile(BaseModel):
 
 
 class AuditRequest(BaseModel):
-    mode: Literal["single", "context", "loop"] = "single"
+    mode: Literal["single", "context", "loop", "specialists"] = "single"
     rounds: int = Field(default=5, ge=1, le=10)
     confirmed_paid: bool = False
     model: str | None = Field(default=None, max_length=256)
@@ -183,11 +188,11 @@ class AuditStore:
 
     def list(self) -> list[dict]:
         with self.lock:
-            return [
-                {key: value for key, value in job.items() if key not in ("context", "findings")}
+            return json.loads(json.dumps([
+                {key: value for key, value in job.items() if key not in ("context", "findings", "findings_by_lane")}
                 | {"findings_count": len(job["findings"])}
                 for job in reversed(list(self.jobs.values()))
-            ]
+            ]))
 
     def start(self, request: AuditRequest, codebase: str, source: dict | None = None) -> dict:
         model = request.model if request.model is not None else llm.default_model()
@@ -197,7 +202,7 @@ class AuditStore:
             while len(self.jobs) >= 50:
                 del self.jobs[next(iter(self.jobs))]
             job_id = uuid4().hex
-            rounds = request.rounds if request.mode == "loop" else 1
+            rounds = request.rounds if request.mode in ("loop", "specialists") else 1
             job = {
                 "id": job_id, "status": "queued", "stage": "Queued",
                 "mode": request.mode, "rounds": rounds, "completed_rounds": 0,
@@ -208,12 +213,124 @@ class AuditStore:
                 "target": source["repository"] if source else "SecondSwap" if request.target == "bundled" else "Uploaded contracts",
                 "source": source,
             }
+            if request.mode == "specialists":
+                job.update(
+                    total_rounds=len(SPECIALIST_LANES) * rounds,
+                    max_model_calls=2 + len(SPECIALIST_LANES) * rounds,
+                    lanes=[lane | {
+                        "status": "queued", "completed_rounds": 0, "rounds": rounds,
+                        "findings_count": 0, "error": None,
+                    } for lane in SPECIALIST_LANES],
+                    judge_status="queued",
+                    findings_by_lane={lane["key"]: [] for lane in SPECIALIST_LANES},
+                )
             self.jobs[job_id] = job
         self.executor.submit(
                     self.run, job_id, codebase, request.mode, rounds,
                     model, request.json_mode, request.reasoning_effort,
                 )
         return self.get(job_id)
+
+    def update_lane(self, job_id: str, key: str, *, findings=None, warnings=(), **values):
+        """Publish a lane's progress and aggregate it atomically, without shared snapshots."""
+        with self.lock:
+            job = self.jobs[job_id]
+            lane = next(lane for lane in job["lanes"] if lane["key"] == key)
+            lane.update(values)
+            if findings is not None:
+                job["findings_by_lane"][key] = list(findings)
+                lane["findings_count"] = len(findings)
+            job["warnings"].extend(warnings)
+            job["completed_rounds"] = sum(lane["completed_rounds"] for lane in job["lanes"])
+
+    def fail_specialists(self, job_id: str):
+        with self.lock:
+            job = self.jobs[job_id]
+            for lane in job["lanes"]:
+                if lane["status"] in ("queued", "running"):
+                    lane["status"] = "stopped"
+            if job["judge_status"] in ("queued", "running"):
+                job["judge_status"] = "skipped"
+            job["warnings"].append(
+                "Specialist audit is incomplete. Lane candidates are partial, unjudged results; "
+                "empty final findings do not indicate a clean audit."
+            )
+
+    def run_specialists(
+        self, job_id: str, codebase: str, protocol_context: str, rounds: int,
+        model: str, json_mode: bool, reasoning_effort: str | None,
+    ):
+        stop = Event()
+        options = {"model": model, "json_mode": json_mode, "reasoning_effort": reasoning_effort}
+
+        def run_lane(key: str):
+            findings = []
+            try:
+                for index in range(rounds):
+                    if stop.is_set() or self.stopping.is_set():
+                        self.update_lane(job_id, key, status="stopped")
+                        return
+                    self.update_lane(job_id, key, status="running")
+                    if key == "general_hunter":
+                        system = agent.SYSTEM_PROMPT
+                        plain = agent.CONTEXT_AWARE_USER_PROMPT_TEMPLATE
+                        exclusion = agent.EXCLUSION_USER_PROMPT_TEMPLATE
+                    else:
+                        system, plain = specialists._PROMPTS[key]
+                        _, exclusion = specialists._EXCLUSION_PROMPTS[key]
+                    prior = "\n".join(f"- {f['title']}: {f['description']}" for f in findings)
+                    prompt = (exclusion if prior else plain).format(
+                        codebase=codebase, context=protocol_context, already_found=prior,
+                    )
+                    # Best effort: do not cancel calls already in flight.
+                    if stop.is_set() or self.stopping.is_set():
+                        self.update_lane(job_id, key, status="stopped")
+                        return
+                    new, notices = parse_findings(llm.complete(system, prompt, **options))
+                    findings.extend(new)
+                    self.update_lane(
+                        job_id, key, findings=findings, completed_rounds=index + 1,
+                        warnings=[f"{key} · round {index + 1}: {notice}" for notice in notices],
+                    )
+                self.update_lane(job_id, key, status="completed")
+            except Exception as exc:  # noqa: BLE001 - redact all provider failures before snapshots or exports.
+                stop.set()
+                error = str(exc) if isinstance(exc, AuditOutputError) else PROVIDER_ERROR
+                self.update_lane(job_id, key, status="failed", error=error)
+
+        self.update(job_id, stage="Auditing · six parallel lanes")
+        with ThreadPoolExecutor(max_workers=len(SPECIALIST_LANES), thread_name_prefix="lucid-lane") as executor:
+            futures = [executor.submit(run_lane, lane["key"]) for lane in SPECIALIST_LANES]
+            for future in futures:
+                future.result()
+        # All in-flight results have been published before the job can finish or judge.
+        self.check_shutdown()
+        snapshot = self.get(job_id)
+        if stop.is_set():
+            error = next(lane["error"] for lane in snapshot["lanes"] if lane["status"] == "failed")
+            raise AuditOutputError(error)
+        if not any(snapshot["findings_by_lane"].values()):
+            self.update(job_id, judge_status="skipped")
+            return
+        pool = {
+            key: [Finding.model_validate(finding) for finding in findings]
+            for key, findings in snapshot["findings_by_lane"].items()
+        }
+        prompt = judge.JUDGE_USER_PROMPT_TEMPLATE.format(
+            pooled_findings=judge._format_pool(pool), codebase=codebase,
+        )
+        self.check_shutdown()
+        self.update(job_id, stage="Judging pooled candidates", judge_status="running")
+        try:
+            self.check_shutdown()
+            findings, notices = parse_findings(llm.complete(judge.JUDGE_SYSTEM_PROMPT, prompt, **options))
+        except Exception:
+            self.update(job_id, judge_status="failed")
+            raise
+        self.update(
+            job_id, findings=findings, judge_status="completed",
+            warnings=snapshot["warnings"] + [f"Judge: {notice}" for notice in notices],
+        )
 
     def run(
         self, job_id: str, codebase: str, mode: str, rounds: int,
@@ -232,6 +349,12 @@ class AuditStore:
                 if not protocol_context.strip():
                     raise AuditOutputError("Model returned an empty protocol context. Retry the audit.")
                 self.update(job_id, context=protocol_context)
+            if mode == "specialists":
+                self.run_specialists(
+                    job_id, codebase, protocol_context, rounds, model, json_mode, reasoning_effort,
+                )
+                self.update(job_id, status="completed", stage="Audit complete")
+                return
             findings, warnings = [], []
             for index in range(rounds):
                 self.update(job_id, stage=f"Auditing · round {index + 1} of {rounds}")
@@ -256,12 +379,16 @@ class AuditStore:
                 self.update(job_id, findings=list(findings), warnings=list(warnings), completed_rounds=index + 1)
             self.update(job_id, status="completed", stage="Audit complete")
         except AuditOutputError as exc:
+            if mode == "specialists":
+                self.fail_specialists(job_id)
             self.update(job_id, status="failed", stage="Audit failed", error=str(exc))
         except Exception:  # noqa: BLE001 - provider failures must be redacted at this boundary.
             # Provider exception text can contain credentials or private source.
+            if mode == "specialists":
+                self.fail_specialists(job_id)
             self.update(
                 job_id, status="failed", stage="Audit failed",
-                error="Provider request failed. Check your backend API key, base URL, model, credits, and network. Earlier rounds remain available; retries may incur additional charges.",
+                error=PROVIDER_ERROR,
             )
 
 
@@ -327,30 +454,6 @@ def models():
     except Exception as exc:  # Never expose provider exception details.
         raise HTTPException(502, "Could not load provider models. Check your backend key, base URL, and network, or enter a model ID manually. No inference was requested.") from exc
 
-
-def saved_example(path: Path) -> dict:
-    data = json.loads(path.read_text())
-    # Module 3 stores the final report separately from its per-lane candidates.
-    if "findings" not in data and "judged_findings" in data:
-        data["findings"] = data["judged_findings"]
-    return data
-
-
-@app.get("/api/examples")
-def examples():
-    return [
-        {"id": path.stem, "title": path.stem.replace("-", " ").title(),
-         "findings_count": len(saved_example(path)["findings"])}
-        for path in sorted(EXAMPLES.glob("*.json"))
-    ]
-
-
-@app.get("/api/examples/{example_id}")
-def example(example_id: str):
-    paths = {path.stem: path for path in EXAMPLES.glob("*.json")}
-    if example_id not in paths:
-        raise HTTPException(404, "Saved example not found.")
-    return saved_example(paths[example_id])
 
 
 @app.get("/api/audits")
