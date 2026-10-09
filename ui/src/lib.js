@@ -93,7 +93,22 @@ export async function request(path, { signal, method = 'GET', body, timeoutMs = 
   let data;
   try { data = text ? JSON.parse(text) : null; } catch { /* Handled below, without displaying proxy HTML. */ }
   if (!response.ok) {
-    if (modelsRequest) throw new Error(`API ${response.status}: Could not load models. Check the backend and provider configuration, or enter a model ID manually. Provider error details are hidden.`);
+    if (modelsRequest) {
+      // Only allowlisted status codes are interpreted; provider text stays hidden.
+      const advice = new Map([
+        [400, 'Provider rejected the request (HTTP 400). Check the configured base URL.'],
+        [401, 'Provider authentication failed (HTTP 401). Check the API key and restart the backend.'],
+        [402, 'Provider requires payment (HTTP 402). Check provider credits and billing.'],
+        [403, 'Provider denied access (HTTP 403). Check key validity and endpoint permissions. Requesty requires a Requesty API key, not a ChatGPT subscription credential.'],
+        [404, 'Provider endpoint was not found (HTTP 404). Check the configured base URL.'],
+        [429, 'Provider rate or quota limit reached (HTTP 429). Check provider credits and limits.'],
+        [500, 'Provider service failed (HTTP 500). Check provider service status.'],
+        [502, 'Provider service failed (HTTP 502). Check provider service status.'],
+        [503, 'Provider service failed (HTTP 503). Check provider service status.'],
+        [504, 'Provider service timed out (HTTP 504). Try loading models later.'],
+      ]).get(data?.provider_status);
+      throw new Error(`API ${response.status}: Could not load models. ${advice || 'Check the backend and provider configuration, or enter a model ID manually. Provider error details are hidden.'} No inference was requested.`);
+    }
     const detail = typeof data?.detail === 'string' ? data.detail : typeof data?.error === 'string' ? data.error : Array.isArray(data?.detail) ? data.detail.map((item) => item.msg).join('; ') : '';
     const action = response.status === 403 ? 'Use the local UI origin and check the backend CSRF configuration.'
       : githubPreview ? 'Check the public repository root URL, ref, and subdirectory, and the backend’s GitHub connectivity, then preview again. No model calls were requested.'

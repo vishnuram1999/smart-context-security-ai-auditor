@@ -8,6 +8,9 @@ import unittest
 from threading import Event
 from unittest.mock import patch
 
+import httpx
+import openai
+
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -17,6 +20,7 @@ from lucid.web import (
     SourceFile,
     app,
     parse_findings,
+    provider_error,
     uploaded_codebase,
 )
 
@@ -107,6 +111,58 @@ class WebTests(unittest.TestCase):
             self.assertEqual(job["status"], "failed")
             self.assertNotIn("secret-token", job["error"])
 
+    def test_provider_status_categories_never_expose_raw_details(self):
+        for status in (400, 401, 402, 403, 404, 413, 429, 500, 503, 418):
+            with self.subTest(status=status):
+                error = openai.APIStatusError(
+                    "secret-token private-source", body={"secret": "secret-token"},
+                    response=httpx.Response(status, request=httpx.Request("GET", "https://provider.example/v1/models")),
+                )
+                message = provider_error(error)
+                self.assertNotIn("secret-token", message)
+                self.assertNotIn("private-source", message)
+                if status < 500 and status != 418:
+                    self.assertIn(f"HTTP {status}", message)
+                elif status >= 500:
+                    self.assertIn("HTTP 5xx", message)
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "fake"}), patch("lucid.web.llm.list_models", side_effect=error):
+                    response = self.client.get("/api/models")
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.json()["provider_status"], status)
+                self.assertNotIn("secret-token", response.text)
+                self.assertNotIn("private-source", response.text)
+        request = httpx.Request("GET", "https://provider.example")
+        self.assertIn("timed out", provider_error(openai.APITimeoutError(request=request)))
+        self.assertIn("connect", provider_error(openai.APIConnectionError(request=request, message="secret-token")))
+
+    def test_provider_status_reaches_audit_context_lane_and_judge(self):
+        from lucid import judge
+        error = openai.PermissionDeniedError(
+            "secret-token private-source", body="secret-token",
+            response=httpx.Response(403, request=httpx.Request("POST", "https://provider.example/v1/chat/completions")),
+        )
+        for phase in ("context", "lane", "judge"):
+            with self.subTest(phase=phase):
+                def complete(system, *args, **kwargs):
+                    if phase == "lane" or system == judge.JUDGE_SYSTEM_PROMPT:
+                        raise error
+                    return json.dumps({"findings": [FINDING]})
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "fake"}), patch(
+                    "lucid.web.context.build_context", side_effect=error if phase == "context" else None, return_value="Context",
+                ), patch("lucid.web.llm.complete", side_effect=complete):
+                    response = self.client.post("/api/audits", headers=HEADERS, json={"confirmed_paid": True, "mode": "specialists", "rounds": 1})
+                    job = self.wait(response.json()["id"])
+                self.assertEqual(job["status"], "failed")
+                self.assertIn("HTTP 403", job["error"])
+                self.assertNotIn("secret-token", json.dumps(job))
+                self.assertNotIn("private-source", json.dumps(job))
+                if phase == "lane":
+                    failed = [lane for lane in job["lanes"] if lane["status"] == "failed"]
+                    self.assertTrue(failed)
+                    self.assertTrue(all("HTTP 403" in lane["error"] for lane in failed))
+                if phase == "judge":
+                    self.assertEqual(job["judge_status"], "failed")
+
     def test_shutdown_stops_additional_calls(self):
         store = AuditStore()
         entered, release = Event(), Event()
@@ -156,6 +212,47 @@ class WebTests(unittest.TestCase):
             self.assertEqual(job["target"], "owner/repo")
             self.assertIn("// FILE: src/A.sol", complete.call_args.args[1])
             fetch.assert_not_called()
+
+    def test_github_scope_is_validated_pinned_and_used_in_every_phase(self):
+        from lucid import judge
+        files = [
+            {"path": "src/A.sol", "content": "contract Included {}"},
+            {"path": "src/B.sol", "content": "contract Excluded {}"},
+        ]
+        snapshot = {
+            "repository_url": "https://github.com/owner/repo", "repository": "owner/repo",
+            "ref": "main", "commit": "a" * 40, "subdirectory": "src",
+            "files": files, "file_count": 2, "total_chars": sum(len(file["content"]) for file in files),
+        }
+        with patch("lucid.web.fetch_repository", return_value=snapshot):
+            preview = self.client.post("/api/github/preview", headers=HEADERS, json={"url": snapshot["repository_url"]}).json()
+        body = {"target": "github", "github_preview_id": preview["id"], "confirmed_paid": True, "mode": "specialists", "rounds": 1}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "fake"}), patch("lucid.web.context.build_context", return_value="Context") as build, patch("lucid.web.llm.complete", return_value=json.dumps({"findings": [FINDING]})) as complete, patch("lucid.web.fetch_repository") as fetch:
+            for paths in ([], ["src/Unknown.sol"], ["../A.sol"], ["src/A.sol", "src/A.sol"]):
+                response = self.client.post("/api/audits", headers=HEADERS, json=body | {"github_paths": paths})
+                self.assertEqual(response.status_code, 400)
+            build.assert_not_called()
+            complete.assert_not_called()
+            response = self.client.post("/api/audits", headers=HEADERS, json=body | {"github_paths": ["src/A.sol"], "files": [{"path": "src/A.sol", "content": "tampered"}]})
+            self.assertEqual(response.status_code, 202)
+            job = self.wait(response.json()["id"])
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(job["source"]["scope_paths"], ["src/A.sol"])
+            self.assertEqual(job["source"]["file_count"], 1)
+            self.assertEqual(job["source"]["total_chars"], len(files[0]["content"]))
+            self.assertIn("Included", build.call_args.args[0])
+            self.assertNotIn("Excluded", build.call_args.args[0])
+            self.assertEqual(complete.call_count, 7)
+            self.assertEqual(complete.call_args.args[0], judge.JUDGE_SYSTEM_PROMPT)
+            for call in complete.call_args_list:
+                self.assertIn("Included", call.args[1])
+                self.assertNotIn("Excluded", call.args[1])
+                self.assertNotIn("tampered", call.args[1])
+            fetch.assert_not_called()
+        # Selecting a subset does not mutate the cached snapshot.
+        source, full = self.client.app.state.previews.get(preview["id"])
+        self.assertEqual(source["scope_paths"], ["src/A.sol", "src/B.sol"])
+        self.assertIn("Excluded", full)
 
     def test_github_preview_errors_and_expiry(self):
         from lucid.github import GitHubSourceError

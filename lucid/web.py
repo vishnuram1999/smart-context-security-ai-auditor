@@ -11,6 +11,7 @@ from threading import Event, Lock
 from typing import Literal
 from uuid import uuid4
 
+import openai
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -39,6 +40,29 @@ ALLOWED_ORIGINS = {
 }
 
 
+def provider_error(exc: Exception) -> str:
+    """Expose only SDK error categories/status codes, never provider text or bodies."""
+    if isinstance(exc, openai.APIStatusError):
+        messages = {
+            400: "Provider rejected the request (HTTP 400). Check model support, JSON/reasoning settings, and context size.",
+            401: "Provider authentication failed (HTTP 401). Set a valid API key for the configured provider and restart the backend.",
+            402: "Provider requires payment (HTTP 402). Check your provider credits and billing.",
+            403: "Provider denied access (HTTP 403). Check whether your key is valid, active, and allowed to use this endpoint/model. For Requesty, use a Requesty API key—not a ChatGPT subscription credential.",
+            404: "Provider endpoint or model was not found (HTTP 404). Check the base URL and select an available model ID.",
+            413: "Provider rejected the request size (HTTP 413). Select a smaller source scope.",
+            429: "Provider rate or quota limit reached (HTTP 429). Check credits, quotas, and concurrency limits before retrying.",
+        }
+        if exc.status_code in messages:
+            return messages[exc.status_code]
+        if exc.status_code >= 500:
+            return "Provider service failed (HTTP 5xx). Check provider service status before retrying."
+    if isinstance(exc, openai.APITimeoutError):
+        return "Provider request timed out. Check connectivity and try a smaller target before retrying."
+    if isinstance(exc, openai.APIConnectionError):
+        return "Could not connect to the provider. Check network connectivity and the configured base URL."
+    return PROVIDER_ERROR
+
+
 class SourceFile(BaseModel):
     path: str = Field(min_length=1, max_length=240)
     content: str = Field(max_length=MAX_CHARS)
@@ -59,6 +83,7 @@ class AuditRequest(BaseModel):
     target: Literal["bundled", "upload", "github"] = "bundled"
     files: list[SourceFile] = Field(default_factory=list, max_length=200)
     github_preview_id: str = Field(default="", max_length=32)
+    github_paths: list[str] | None = Field(default=None, max_length=200)
 
 
 class GitHubPreviewRequest(BaseModel):
@@ -128,13 +153,28 @@ class PreviewStore:
             self.snapshots[preview["id"]] = (time.monotonic(), preview, codebase)
             return preview
 
-    def get(self, preview_id: str) -> tuple[dict, str]:
+    def get(self, preview_id: str, paths: list[str] | None = None) -> tuple[dict, str]:
         with self.lock:
             self.prune()
             if preview_id not in self.snapshots:
                 raise HTTPException(400, "GitHub preview expired or was removed. Preview the repository again; no paid call has started.")
             _, preview, codebase = self.snapshots[preview_id]
             source = {key: preview[key] for key in ("repository_url", "repository", "ref", "commit", "subdirectory")}
+            files = preview["files"]
+            if paths is not None:
+                available = {file["path"] for file in files}
+                if not paths:
+                    raise ValueError("Select at least one Solidity file in the audit scope.")
+                if len(paths) != len(set(paths)) or any(path not in available for path in paths):
+                    raise ValueError("Audit scope must contain unique paths from the pinned GitHub preview.")
+                selected = set(paths)
+                files = [file for file in files if file["path"] in selected]
+                codebase = uploaded_codebase([SourceFile.model_validate(file) for file in files])
+            source.update(
+                scope_paths=[file["path"] for file in files],
+                file_count=len(files),
+                total_chars=sum(len(file["content"]) for file in files),
+            )
             return source, codebase
 
 
@@ -295,7 +335,7 @@ class AuditStore:
                 self.update_lane(job_id, key, status="completed")
             except Exception as exc:  # noqa: BLE001 - redact all provider failures before snapshots or exports.
                 stop.set()
-                error = str(exc) if isinstance(exc, AuditOutputError) else PROVIDER_ERROR
+                error = str(exc) if isinstance(exc, AuditOutputError) else provider_error(exc)
                 self.update_lane(job_id, key, status="failed", error=error)
 
         self.update(job_id, stage="Auditing · six parallel lanes")
@@ -382,13 +422,13 @@ class AuditStore:
             if mode == "specialists":
                 self.fail_specialists(job_id)
             self.update(job_id, status="failed", stage="Audit failed", error=str(exc))
-        except Exception:  # noqa: BLE001 - provider failures must be redacted at this boundary.
+        except Exception as exc:  # Provider failures must be redacted at this boundary.
             # Provider exception text can contain credentials or private source.
             if mode == "specialists":
                 self.fail_specialists(job_id)
             self.update(
                 job_id, status="failed", stage="Audit failed",
-                error=PROVIDER_ERROR,
+                error=provider_error(exc),
             )
 
 
@@ -452,7 +492,10 @@ def models():
     try:
         return {"models": llm.list_models()}
     except Exception as exc:  # Never expose provider exception details.
-        raise HTTPException(502, "Could not load provider models. Check your backend key, base URL, and network, or enter a model ID manually. No inference was requested.") from exc
+        return JSONResponse(status_code=502, content={
+            "detail": f"Could not load provider models. {provider_error(exc)} No inference was requested.",
+            "provider_status": exc.status_code if isinstance(exc, openai.APIStatusError) else None,
+        })
 
 
 
@@ -492,7 +535,7 @@ def create_audit(body: AuditRequest, request: Request):
     source = None
     try:
         if body.target == "github":
-            source, codebase = request.app.state.previews.get(body.github_preview_id)
+            source, codebase = request.app.state.previews.get(body.github_preview_id, body.github_paths)
         else:
             codebase = load_codebase(str(TARGET)) if body.target == "bundled" else uploaded_codebase(body.files)
     except (ValueError, FileNotFoundError) as exc:

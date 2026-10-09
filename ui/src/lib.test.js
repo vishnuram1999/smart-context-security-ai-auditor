@@ -32,6 +32,19 @@ test('model requests are bounded, cancellable, and hide provider error details',
     await assert.rejects(request('/api/models', { signal: controller.signal }), { name: 'AbortError' });
   } finally { globalThis.fetch = originalFetch; AbortSignal.timeout = originalTimeout; }
 });
+test('model errors show only allowlisted provider status guidance', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [400, 401, 402, 403, 404, 429, 500, 502, 503, 504]) {
+      globalThis.fetch = async () => Response.json({ provider_status: status, detail: 'Authorization: Bearer sk-secret' }, { status: 502 });
+      await assert.rejects(request('/api/models'), (error) => error.message.includes(`HTTP ${status}`) && error.message.includes('No inference') && !/Bearer|sk-secret/.test(error.message));
+    }
+    for (const status of ['403', 'sk-secret', null, 418, '__proto__', 'constructor']) {
+      globalThis.fetch = async () => Response.json({ provider_status: status, detail: 'sk-secret' }, { status: 502 });
+      await assert.rejects(request('/api/models'), (error) => /details are hidden/.test(error.message) && !/sk-secret/.test(error.message));
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
 test('paid call counts include context only when used', () => {
   assert.equal(callCount('single', 10), 1);
   assert.equal(callCount('context', 10), 2);

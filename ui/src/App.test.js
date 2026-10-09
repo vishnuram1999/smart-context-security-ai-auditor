@@ -94,7 +94,7 @@ test('specialists forward all sources and settings, lock submission, and separat
       assert.match(document.body.textContent, /Up to 14 paid model calls/);
       await flush(() => consent().click());
       await flush(() => button('Start live audit').click());
-      assert.deepEqual(JSON.parse(posts().at(-1).options.body), { mode: 'specialists', rounds: 2, model: 'provider/specialist', json_mode: false, reasoning_effort: 'high', confirmed_paid: true, target, files: target === 'upload' ? [{ path: 'contracts/Vault.sol', content: 'contract Vault {}' }] : [], ...(target === 'github' ? { github_preview_id: 'pinned-preview' } : {}) });
+      assert.deepEqual(JSON.parse(posts().at(-1).options.body), { mode: 'specialists', rounds: 2, model: 'provider/specialist', json_mode: false, reasoning_effort: 'high', confirmed_paid: true, target, files: target === 'upload' ? [{ path: 'contracts/Vault.sol', content: 'contract Vault {}' }] : [], ...(target === 'github' ? { github_preview_id: 'pinned-preview', github_paths: snapshot.files.map((file) => file.path) } : {}) });
       for (const input of document.querySelectorAll('form input, form select')) assert.ok(input.matches(':disabled'), `${input.id || input.name} is locked`);
       assert.ok(button('New audit').disabled);
       await flush(() => document.querySelector('form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })));
@@ -219,6 +219,20 @@ test('GitHub previews are keyless, race-safe, reviewable, and require fresh cons
     assert.equal(button('Start live audit').disabled, true, 'preview is not paid consent');
     await flush(() => consent().click());
     assert.equal(button('Start live audit').disabled, false);
+    await flush(() => document.querySelector('.scope-file input').click());
+    assert.equal(consent().checked, false, 'scope changes clear consent');
+    assert.match(document.body.textContent, /0 of 1 files in scope/);
+    assert.equal(button('Start live audit').disabled, true, 'empty scope cannot start');
+    await flush(() => button('Select all').click());
+    assert.equal(consent().checked, false);
+    assert.match(document.body.textContent, /1 of 1 files in scope/);
+    await flush(() => consent().click());
+    await flush(() => button('Clear selection').click());
+    assert.equal(consent().checked, false);
+    assert.equal(button('Start live audit').disabled, true);
+    await flush(() => document.querySelector('.scope-file input').click());
+    await flush(() => consent().click());
+    assert.equal(button('Start live audit').disabled, false);
     for (const [id, value] of [['github-url', 'https://github.com/owner/other'], ['github-ref', 'v2'], ['github-subdirectory', 'contracts/src']]) {
       await edit(id, value);
       assert.equal(consent().checked, false, `${id} resets consent`);
@@ -245,7 +259,7 @@ test('GitHub previews are keyless, race-safe, reviewable, and require fresh cons
     await flush(() => pending.at(-1).resolve(Response.json(snapshot('paid-preview'))));
     await flush(() => consent().click());
     await flush(() => button('Start live audit').click());
-    assert.deepEqual(JSON.parse(auditPosts()[0].options.body), { mode: 'context', rounds: 1, model: 'test-model', json_mode: true, reasoning_effort: null, confirmed_paid: true, target: 'github', github_preview_id: 'paid-preview', files: [] });
+    assert.deepEqual(JSON.parse(auditPosts()[0].options.body), { mode: 'context', rounds: 1, model: 'test-model', json_mode: true, reasoning_effort: null, confirmed_paid: true, target: 'github', github_preview_id: 'paid-preview', github_paths: ['contracts/src/Vault.sol'], files: [] });
     assert.equal(auditPosts().length, 1);
     assert.equal(window.location.hash, '#/audit/github-job');
     assert.match(document.body.textContent, /owner\/repo/);

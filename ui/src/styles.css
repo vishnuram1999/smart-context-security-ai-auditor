@@ -186,6 +186,13 @@ h3 { font-size: 13px; font-weight: 600; }
 .active-banner { display: flex; align-items: center; gap: 10px; background: #ff593e12; border: 1px solid #9c4b3f; border-radius: 7px; padding: 12px 16px; color: #e5c6c0; font-size: 11px; margin-bottom: 23px; line-height: 1.8; }
 .active-banner > .status-dot { color: var(--accent); }
 .active-banner a { color: var(--accent); margin-left: auto; white-space: nowrap; text-decoration: underline; text-underline-offset: 3px; }
+.scope-selection { margin-top: 20px; }
+.scope-selection legend { font-size: 13px; font-weight: 600; }
+.scope-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.scope-file { display: flex; align-items: center; gap: 10px; min-width: 0; cursor: pointer; }
+.scope-file input { flex-shrink: 0; width: 16px; height: 16px; }
+.report-scope { margin-top: 14px; font-size: 12px; }
+.report-scope ul { padding-left: 20px; overflow-wrap: anywhere; }
 .file-manifest { margin-top: 17px; }
 .manifest-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 10px; }
 .manifest-heading strong { font-weight: 550; }

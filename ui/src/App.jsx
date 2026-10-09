@@ -60,6 +60,7 @@ export default function App() {
   const [submitError, setSubmitError] = useState('');
   const [github, setGithub] = useState({ url: '', ref: '', subdirectory: '' });
   const [preview, setPreview] = useState(null);
+  const [githubPaths, setGithubPaths] = useState([]);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState('');
   const previewRequest = useRef(null);
@@ -130,14 +131,15 @@ export default function App() {
   const activeJobs = jobs.filter(isActive);
   const calls = callCount(mode, rounds);
   const totalChars = useMemo(() => files.reduce((sum, file) => sum + charCount(file.content), 0), [files]);
-  const validationError = target === 'upload' ? validateFiles(files, config?.max_chars) : target === 'github' ? preview ? validateGithubPreview(preview, config?.max_chars) : 'Preview and review the repository before starting a live audit.' : null;
+  const scopedFiles = useMemo(() => preview?.files.filter((file) => githubPaths.includes(file.path)) || [], [preview, githubPaths]);
+  const validationError = target === 'upload' ? validateFiles(files, config?.max_chars) : target === 'github' ? preview ? validateGithubPreview(preview, config?.max_chars) || validateFiles(scopedFiles, config?.max_chars) : 'Preview and review the repository before starting a live audit.' : null;
   const selectedModel = model.trim() || config?.model;
   const modelError = validateModel(selectedModel);
   const canStart = config?.key_configured === true && confirmed && !modelError && !validationError && !reading && !previewLoading && !submitting;
   function clearPreview() {
     previewVersion.current++;
     previewRequest.current?.abort(); previewRequest.current = null;
-    setPreview(null); setPreviewLoading(false); setPreviewError(''); setConfirmed(false); setSubmitError('');
+    setPreview(null); setGithubPaths([]); setPreviewLoading(false); setPreviewError(''); setConfirmed(false); setSubmitError('');
   }
   function editGithub(field, value) {
     clearPreview();
@@ -157,7 +159,7 @@ export default function App() {
       if (controller.signal.aborted || version !== previewVersion.current) return;
       const error = validateGithubPreview(data, config?.max_chars);
       if (error) throw new Error(error);
-      setPreview(data); setConfirmed(false);
+      setPreview(data); setGithubPaths(data.files.map((file) => file.path)); setConfirmed(false);
     } catch (error) {
       if (!controller.signal.aborted && version === previewVersion.current) setPreviewError(error.message);
     } finally {
@@ -219,7 +221,7 @@ export default function App() {
     if (!canStart || submitLock.current) return;
     submitLock.current = true; setSubmitting(true); setSubmitError('');
     try {
-      const job = await request('/api/audits', { method: 'POST', body: { mode, rounds: requestRounds(mode, rounds), model: selectedModel, json_mode: jsonMode, reasoning_effort: reasoningEffort, confirmed_paid: true, target, files: target === 'upload' ? files : [], ...(target === 'github' ? { github_preview_id: preview.id } : {}) } });
+      const job = await request('/api/audits', { method: 'POST', body: { mode, rounds: requestRounds(mode, rounds), model: selectedModel, json_mode: jsonMode, reasoning_effort: reasoningEffort, confirmed_paid: true, target, files: target === 'upload' ? files : [], ...(target === 'github' ? { github_preview_id: preview.id, github_paths: githubPaths } : {}) } });
       if (!job.id) throw new Error('The API did not return a job ID. Refresh history before submitting again.');
       upsertJob(job); setConfirmed(false); window.location.hash = routeHref('audit', job.id);
       retryAll();
@@ -266,7 +268,8 @@ export default function App() {
                               <button type="button" className="secondary-button" disabled={submitting || previewLoading || !github.url} onClick={previewRepository}><Icon name="search" size={16} />{previewLoading ? 'Previewing repository…' : 'Preview repository'}</button>
                               {previewLoading && <p role="status" className="github-help">Fetching and pinning Solidity source. This may take up to 60 seconds. Editing any field cancels this preview.</p>}
                               {previewError && <Notice onRetry={previewRepository}>{previewError}</Notice>}
-                              {preview && <GithubPreview preview={preview} />}
+                              {preview && <GithubPreview preview={preview} paths={githubPaths} disabled={submitting} onScopeChange={(paths) => { if (submitLock.current) return; setGithubPaths(paths); setConfirmed(false); setSubmitError(''); }} />}
+                                                            {preview && validationError && <Notice>{validationError}</Notice>}
                             </div> : <div className="upload-source">
                 <Icon name="upload" size={29} /><h3>Bring your Solidity source</h3><p>Select multiple .sol files, or a folder to preserve relative paths.</p><div className="upload-actions"><button type="button" className="secondary-button" disabled={reading || submitting} onClick={() => fileInput.current?.click()}>Choose .sol files</button><button type="button" className="text-button" disabled={reading || submitting} onClick={() => folderInput.current?.click()}>Choose folder</button></div>
                 <input ref={fileInput} type="file" disabled={reading || submitting} multiple accept=".sol" className="sr-only" tabIndex={-1} aria-label="Upload Solidity files" onChange={(event) => { readSources(event.target.files); event.target.value = ''; }} />
@@ -317,18 +320,25 @@ export default function App() {
 function RepositoryMetadata({ source }) {
   const safeUrl = typeof source.repository_url === 'string' && !validateGithubUrl(source.repository_url) ? source.repository_url.replace(/\/$/, '') : null;
   const commitUrl = safeUrl && /^[a-fA-F0-9]{40}$/.test(source.commit || '') ? `${safeUrl}/commit/${source.commit}` : null;
-  return <dl className="report-meta repository-meta">
+  return <><dl className="report-meta repository-meta">
     <div><dt>Repository</dt><dd>{safeUrl ? <a href={safeUrl} target="_blank" rel="noopener noreferrer">{source.repository || source.repository_url}</a> : source.repository || 'Not recorded'}</dd></div>
     <div><dt>Pinned commit</dt><dd>{commitUrl ? <a href={commitUrl} target="_blank" rel="noopener noreferrer"><code>{source.commit}</code></a> : source.commit || 'Not recorded'}</dd></div>
     <div><dt>Ref / subdirectory</dt><dd>{source.ref || 'Default branch'} · {source.subdirectory || 'Repository root'}</dd></div>
-  </dl>;
+  </dl>{Array.isArray(source.scope_paths) && <details className="report-scope"><summary>Audit scope · {source.scope_paths.length} Solidity files</summary><ul>{source.scope_paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul></details>}</>;
 }
-function GithubPreview({ preview }) {
+function GithubPreview({ preview, paths, disabled, onScopeChange }) {
+  const selected = preview.files.filter((file) => paths.includes(file.path));
+  const selectedChars = selected.reduce((sum, file) => sum + charCount(file.content), 0);
   return <div className="github-preview">
     <h3>Repository preview · pinned source snapshot</h3>
     <RepositoryMetadata source={preview} />
-    <div className="file-manifest"><div className="manifest-heading"><strong>{preview.file_count} files selected <span className="muted">· {preview.total_chars.toLocaleString()} characters</span></strong></div><ul>{preview.files.map((file) => <li key={file.path}><Icon name="file" size={14} /><code>{file.path}</code><small>{charCount(file.content).toLocaleString()} chars</small></li>)}</ul></div>
-    <p className="github-help">Review the exact source below before authorizing paid usage. The audit uses this pinned preview, not a moving branch.</p>
+    <fieldset disabled={disabled} className="scope-selection">
+      <legend>Contracts in audit scope</legend>
+      <p className="github-help">Only checked Solidity files are sent to the model, including for protocol context and judging. Include relevant dependencies manually; imports are not added automatically. Changing scope clears paid consent.</p>
+      <div className="scope-actions"><button type="button" className="secondary-button" onClick={() => onScopeChange(preview.files.map((file) => file.path))}>Select all</button><button type="button" className="secondary-button" onClick={() => onScopeChange([])}>Clear selection</button></div>
+      <div className="file-manifest"><div className="manifest-heading"><strong>{selected.length} of {preview.file_count} files in scope <span className="muted">· {selectedChars.toLocaleString()} characters</span></strong></div><ul>{preview.files.map((file) => <li key={file.path}><label className="scope-file"><input type="checkbox" checked={paths.includes(file.path)} aria-label={`Include ${file.path} in audit scope`} onChange={(event) => onScopeChange(event.target.checked ? [...paths, file.path] : paths.filter((path) => path !== file.path))} /><code>{file.path}</code></label><small>{charCount(file.content).toLocaleString()} chars</small></li>)}</ul></div>
+    </fieldset>
+    <p className="github-help">Review the source below before authorizing paid usage. Unchecked files are out of scope. The audit uses this pinned preview, not a moving branch.</p>
     <div className="source-review">{preview.files.map((file) => <details key={file.path}><summary><Icon name="file" size={14} /><code>{file.path}</code><span className="accordion-chevron" aria-hidden="true">⌄</span></summary><pre aria-label={`Source of ${file.path}`}><code>{file.content.split('\n').map((line, index) => <span className="source-line" key={index}><span className="line-number" aria-hidden="true">{index + 1}</span><span>{line || '\u00a0'}</span></span>)}</code></pre></details>)}</div>
   </div>;
 }

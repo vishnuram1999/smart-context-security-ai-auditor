@@ -174,6 +174,14 @@ line-numbered source without an AI key or model charges. This contacts GitHub,
 so normal network access and anonymous GitHub rate limits apply. Only public
 repositories are supported; no GitHub credentials are accepted.
 
+After previewing, use **Contracts in audit scope** to check the Solidity files
+that should be audited. All files start selected; **Select all** and **Clear
+selection** make bulk changes easy. At least one file is required. Only selected
+files are sent for protocol context, audit lanes/rounds, and judging; imported
+dependencies are not automatically included, so select relevant dependencies
+and cross-contract logic yourself. Scope changes clear paid consent. Reports
+and JSON exports record the exact selected file paths.
+
 The preview resolves to an immutable commit. A paid scan uses that exact
 in-memory source snapshot, not a fresh download of the branch. Repository URL,
 commit, ref, and scope are included in the report/JSON export. Changing the
