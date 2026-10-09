@@ -14,13 +14,12 @@ curve climbs from *a few* bugs to *most*.
 
 - **Module 1 — your first harness.** One reasoning agent → structured findings.
   Honest baseline on the target: catches a few.
-- **Module 2 — context + loop** _(coming next)_. A protocol-context pass plus
-  an exclusion loop that tells each round what earlier rounds already found.
-  No judge — precision was already near 100% without one, so the judge moved
-  to Module 3.
-- **Module 3 — an orchestrated harness.** Specialist lenses, fan-out, synthesis.
-  Catches most.
-- **Module 4 — a measured harness + the launchpad.** Recall against ground truth,
+- **Module 2 — context + loop.** A protocol-context pass plus an exclusion
+  loop that tells each round what earlier rounds already found.
+- **Module 3 — an orchestrated harness.** Five specialist agents plus the
+  general hunter, run in parallel, and a judge that checks every finding
+  against the code. Catches more than half.
+- **Module 4 — a measured harness + the launchpad** _(coming next)_. Recall against ground truth,
   honestly, plus the self-improvement loop handed over as a transferable method.
 
 ## The tool you build: `lucid`
@@ -61,11 +60,16 @@ provider, change `OPENAI_BASE_URL`, the backend key, and the model ID.
 Run these from the repo root, so `lucid` resolves as a package:
 
 ```bash
-python -m lucid.run                    # scan the default target (bundled SecondSwap)
-python -m lucid.run path/to/contracts  # scan a directory you choose
+python -m lucid.run                    # Module 1: one agent, one pass over the bundled SecondSwap
+python -m lucid.run path/to/contracts  # same, on a directory you choose
+python -m lucid.run --context          # Module 2: protocol context + one context-aware pass
+python -m lucid.run --loop             # Module 2: context + 5-round exclusion loop (--loop 3 for fewer)
+python -m lucid.run --specialists      # Module 3: 5 specialists + hunter, 10 rounds each, + judge (--specialists 5 = 5 rounds per lane)
 ```
 
-Warning: this makes a real, paid API call to the model each time you run it.
+Every run makes real, paid API calls. Upstream measured the bundled target at
+about $0.13 for `--loop` and $1.30/~35 minutes for `--specialists`. These are
+historical measurements, not estimates for your selected model or settings.
 
 ## Local web dashboard
 
@@ -85,7 +89,7 @@ you can start it now with `.venv/bin/python -m lucid.web`.
 If Homebrew's Node 24 executable is not on your PATH, prefix npm commands with
 `PATH=/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/usr/bin:/bin`.
 
-- Browse the 13 saved examples without an API key or model calls.
+- Browse the 15 saved examples without an API key or model calls.
 - Scan bundled SecondSwap, upload `.sol` files/a contract folder, or preview a
   public GitHub repository.
 - Choose a single pass, context-aware pass, or 1–10 exclusion rounds.

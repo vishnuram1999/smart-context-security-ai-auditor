@@ -49,8 +49,13 @@ class WebTests(unittest.TestCase):
         self.assertEqual(config["provider"], "example.com")
         self.assertNotIn("secret", json.dumps(config))
         examples = self.client.get("/api/examples").json()
-        self.assertEqual(len(examples), 13)
-        self.assertIn("findings", self.client.get(f"/api/examples/{examples[0]['id']}").json())
+        self.assertEqual(len(examples), 15)
+        for example in examples:
+            report = self.client.get(f"/api/examples/{example['id']}").json()
+            self.assertEqual(example["findings_count"], len(report["findings"]))
+            if example["id"].startswith("m3-"):
+                self.assertEqual(report["findings"], report["judged_findings"])
+                self.assertIn("findings_by_lane", report)
         self.assertEqual(self.client.get("/api/examples/not-found").status_code, 404)
 
     def test_request_guards(self):

@@ -328,11 +328,19 @@ def models():
         raise HTTPException(502, "Could not load provider models. Check your backend key, base URL, and network, or enter a model ID manually. No inference was requested.") from exc
 
 
+def saved_example(path: Path) -> dict:
+    data = json.loads(path.read_text())
+    # Module 3 stores the final report separately from its per-lane candidates.
+    if "findings" not in data and "judged_findings" in data:
+        data["findings"] = data["judged_findings"]
+    return data
+
+
 @app.get("/api/examples")
 def examples():
     return [
         {"id": path.stem, "title": path.stem.replace("-", " ").title(),
-         "findings_count": len(json.loads(path.read_text())["findings"])}
+         "findings_count": len(saved_example(path)["findings"])}
         for path in sorted(EXAMPLES.glob("*.json"))
     ]
 
@@ -342,7 +350,7 @@ def example(example_id: str):
     paths = {path.stem: path for path in EXAMPLES.glob("*.json")}
     if example_id not in paths:
         raise HTTPException(404, "Saved example not found.")
-    return json.loads(paths[example_id].read_text())
+    return saved_example(paths[example_id])
 
 
 @app.get("/api/audits")
